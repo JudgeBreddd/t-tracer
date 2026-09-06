@@ -1,0 +1,6 @@
+# Belt and braces: .work no longer lives here (see _work_dir in server.py),
+# but nothing traced or downloaded should ever be committed or synced.
+.work/
+.chrome-profile/
+__pycache__/
+T-Tracer

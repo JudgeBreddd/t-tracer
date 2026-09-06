@@ -1,0 +1,489 @@
+/* T-Tracer
+   Tokens and rules from personal-dashboard/best_DESIGN.md: near-black canvas,
+   restrained surfaces, red reserved for active/selected/urgent, ambient glow
+   rather than neon outline, hierarchy from size and spacing over font weight. */
+
+:root{
+  --bg-page:#090A0D;
+  --bg-page-deep:#050609;
+
+  --surface-1:#0E1014;
+  --surface-2:#111318;
+  --surface-3:#15171C;
+  --surface-hover:#181A20;
+
+  --border-subtle:rgba(255,255,255,.07);
+  --border-medium:rgba(255,255,255,.10);
+
+  /* Third pass on this, and the fix was not brightness - it was hue.
+     #D54A4A (best_DESIGN.md) and #E03E3E both have GREEN == BLUE, i.e. hue 0.
+     Red plus green is what the eye reads as orange, and on a near-black ground
+     simultaneous contrast pushes it further that way - the reviewer called it orange
+     twice. Pulling green BELOW blue (G38 / B56, hue ~354) is what makes it read
+     as red rather than warm.
+     Contrast checked, not assumed: 4.66:1 on white text (needs 4.5) and 4.25:1
+     against the canvas (needs 3 for a non-text border). Worth noting the
+     ui-ux-pro-max dark-accent suggestion #EF4444 FAILS the first at 3.76:1. */
+  --accent-red:#E02638;
+  --accent-red-bright:#F53D4E;
+  --accent-red-deep:#8D1622;
+
+  --glow-soft:rgba(224,38,56,.10);
+  --glow-medium:rgba(224,38,56,.20);
+  --glow-strong:rgba(224,38,56,.30);
+
+  --status-green:#54B56C;
+  --status-yellow:#D7A244;
+
+  --text-primary:#ECEDEF;
+  --text-secondary:#B4B7BE;
+  --text-muted:#767A83;
+  --text-faint:#535761;
+
+  --s1:4px; --s2:8px; --s3:12px; --s4:16px; --s5:24px; --s6:32px; --s7:48px;
+  --radius:10px;
+
+  --font:Inter,Geist,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+}
+
+*{box-sizing:border-box}
+
+/* MUST come before any display rule below. The HTML hides the progress bar and
+   the action bar with the [hidden] attribute, whose default display:none has
+   the SAME specificity as a class selector - so .progress{display:flex} and
+   .actionbar{display:flex} silently won, and both were visible on the empty
+   state with a stray "Tracing..." under an untouched dropzone. Caught only by
+   screenshotting the running app. */
+[hidden]{display:none!important}
+html,body{height:100%}
+body{
+  margin:0; background:var(--bg-page); color:var(--text-primary);
+  font-family:var(--font); font-size:13px; line-height:1.5;
+  display:flex; flex-direction:column;
+  -webkit-font-smoothing:antialiased;
+}
+
+/* ---------- top bar ---------- */
+.topbar{
+  display:flex; align-items:center; justify-content:space-between; gap:var(--s5);
+  padding:var(--s4) var(--s5);
+  background:var(--surface-1);
+  border-bottom:1px solid var(--border-subtle);
+  flex-wrap:wrap;
+}
+.brand{display:flex; align-items:center; gap:var(--s3)}
+.brand h1{
+  font-size:15px; font-weight:500; letter-spacing:.01em;
+  text-transform:uppercase; margin:0; color:var(--text-primary);
+}
+.mark{
+  width:9px; height:9px; border-radius:50%;
+  background:var(--accent-red);
+  box-shadow:0 0 10px 2px var(--glow-medium);
+}
+.dest{display:flex; align-items:center; gap:var(--s2); flex:1; max-width:620px; min-width:280px}
+.dest label{
+  font-size:11px; letter-spacing:.06em; text-transform:uppercase;
+  color:var(--text-muted); white-space:nowrap;
+}
+#dest{
+  flex:1; min-width:0;
+  background:var(--bg-page-deep); color:var(--text-primary);
+  border:1px solid var(--border-subtle); border-radius:6px;
+  padding:7px var(--s3); font:inherit; font-size:12px;
+}
+#dest:focus{outline:none; border-color:var(--accent-red-deep); box-shadow:0 0 0 3px var(--glow-soft)}
+
+/* ---------- buttons ---------- */
+button{font:inherit; cursor:pointer; border-radius:6px; transition:background .12s,border-color .12s}
+button:disabled{opacity:.4; cursor:not-allowed}
+.primary{
+  background:var(--accent-red); color:#fff; border:1px solid var(--accent-red);
+  padding:8px var(--s4); font-weight:500;
+}
+.primary:not(:disabled):hover{background:var(--accent-red-bright); border-color:var(--accent-red-bright)}
+.ghost{
+  background:transparent; color:var(--text-secondary);
+  border:1px solid var(--border-medium); padding:7px var(--s3);
+}
+.ghost:hover{background:var(--surface-hover); color:var(--text-primary)}
+button:focus-visible, .dropzone:focus-visible{
+  outline:2px solid var(--accent-red-bright); outline-offset:2px;
+}
+
+/* ---------- tabs ---------- */
+.tabs{
+  display:flex; gap:var(--s1); padding:0 var(--s5);
+  background:var(--surface-1); border-bottom:1px solid var(--border-subtle);
+}
+.tab{
+  background:none; border:none; border-bottom:2px solid transparent;
+  color:var(--text-muted); padding:10px var(--s3); border-radius:0;
+  font-size:12px; letter-spacing:.04em; text-transform:uppercase;
+}
+.tab:hover{color:var(--text-secondary)}
+.tab.on{color:var(--text-primary); border-bottom-color:var(--accent-red)}
+
+/* ---------- history ---------- */
+.history{display:flex; flex-direction:column; gap:var(--s2)}
+.hrow{
+  display:flex; align-items:center; gap:var(--s4);
+  background:var(--surface-1); border:1px solid var(--border-subtle);
+  border-radius:8px; padding:var(--s3) var(--s4);
+}
+.hrow .when{font-size:12px; color:var(--text-primary); white-space:nowrap}
+.hrow .what{
+  flex:1; min-width:0; font-size:11px; color:var(--text-muted);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.hrow .count{font-size:11px; color:var(--text-faint); font-variant-numeric:tabular-nums}
+.hempty{color:var(--text-muted); font-size:12px; padding:var(--s5) 0; text-align:center}
+
+/* ---------- failed state ---------- */
+.card.failed{border-color:var(--border-subtle); opacity:.55}
+.card.failed .strip{filter:grayscale(1)}
+.close{
+  background:none; border:1px solid var(--border-medium); color:var(--text-muted);
+  width:26px; height:26px; padding:0; font-size:15px; line-height:1;
+  display:flex; align-items:center; justify-content:center;
+}
+.close:hover{color:var(--text-primary); border-color:var(--border-medium); background:var(--surface-hover)}
+.nothing{
+  background:none; border:1px solid var(--border-medium); color:var(--text-muted);
+  font-size:11px; padding:4px 10px; white-space:nowrap;
+}
+.nothing:hover{color:var(--text-primary); border-color:var(--border-medium)}
+.nothing.on{color:var(--status-yellow); border-color:var(--status-yellow)}
+.failnote{
+  padding:0 var(--s4) var(--s4); font-size:11px; color:var(--text-muted);
+  margin:0; line-height:1.6;
+}
+.failnote b{color:var(--text-secondary); font-weight:500}
+
+/* ---------- main ---------- */
+#main{flex:1; overflow-y:auto; padding:var(--s5); display:flex; flex-direction:column; gap:var(--s5)}
+.meta{font-size:11px; color:var(--text-muted); margin:0}
+
+/* ---------- dropzone ---------- */
+.dropzone{
+  border:1px dashed var(--border-medium); border-radius:var(--radius);
+  background:var(--surface-1);
+  padding:var(--s7) var(--s5); text-align:center; cursor:pointer;
+  transition:border-color .15s, background .15s, box-shadow .15s;
+}
+.dropzone:hover{background:var(--surface-2); border-color:var(--border-medium)}
+.dropzone.hot{
+  border-color:var(--accent-red); background:var(--surface-2);
+  box-shadow:inset 0 0 40px var(--glow-soft);
+}
+.drop-inner{display:flex; flex-direction:column; align-items:center; gap:var(--s3)}
+.drop-title{font-size:20px; font-weight:500; letter-spacing:-.01em; margin:0}
+.drop-sub{font-size:12px; color:var(--text-muted); margin:0}
+.dropzone.compact{padding:var(--s4)}
+.dropzone.compact .drop-title{font-size:14px}
+.dropzone.compact .drop-sub,.dropzone.compact .primary{display:none}
+
+/* ---------- progress ---------- */
+.progress{display:flex; flex-direction:column; gap:var(--s2)}
+.bar{height:3px; background:var(--surface-3); border-radius:2px; overflow:hidden}
+.bar span{
+  display:block; height:100%; width:0%;
+  background:var(--accent-red); box-shadow:0 0 8px var(--glow-medium);
+  transition:width .3s ease;
+}
+
+/* ---------- results ---------- */
+.results{display:flex; flex-direction:column; gap:var(--s5)}
+/* best_DESIGN.md 3.2: cards are separated by surface contrast, a hairline
+   border, RED AMBIENT GLOW and spacing -- not by large shadows. The first cut
+   used a plain white hairline and dropped the illumination entirely, which is
+   the half that gives the dark canvas its depth. Kept low: light escaping from
+   behind hardware, not a neon outline. */
+.card{
+  background:var(--surface-1);
+  border:1px solid rgba(224,38,56,.18);
+  border-radius:var(--radius); overflow:hidden;
+  box-shadow:0 0 0 1px rgba(0,0,0,.4), 0 0 26px -6px var(--glow-soft);
+}
+.card-head{
+  display:flex; align-items:baseline; justify-content:space-between; gap:var(--s3);
+  padding:var(--s3) var(--s4);
+  border-bottom:1px solid rgba(224,38,56,.14);
+  background:linear-gradient(180deg,rgba(224,38,56,.05),transparent);
+}
+.card-head h2{
+  font-size:13px; font-weight:500; letter-spacing:.01em; text-transform:uppercase;
+  margin:0; color:var(--text-primary);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.card-head .state{font-size:11px; color:var(--text-muted); white-space:nowrap}
+.card-head .state.picked{color:var(--accent-red-bright)}
+
+.strip{display:flex; gap:var(--s3); padding:var(--s4); overflow-x:auto}
+
+/* Laser proofs are black ink on white stock. The plate stays white inside the
+   dark UI - inverting it would hide the artwork the tile exists to show. */
+.tile{
+  flex:0 0 auto; width:172px;
+  background:var(--surface-2); border:1px solid var(--border-subtle);
+  border-radius:8px; padding:var(--s2);
+  display:flex; flex-direction:column; gap:var(--s2);
+  cursor:pointer; position:relative;
+  transition:border-color .12s, background .12s, box-shadow .12s;
+}
+.tile:hover{background:var(--surface-hover)}
+.tile .plate{
+  background:#fff; border-radius:4px; height:150px;
+  display:flex; align-items:center; justify-content:center; overflow:hidden;
+}
+.tile .plate img{max-width:100%; max-height:100%; display:block}
+.tile.source{cursor:default; border-style:dashed}
+.tile.source:hover{background:var(--surface-2)}
+
+.tile.on{border-color:var(--accent-red-deep); box-shadow:0 0 0 1px var(--accent-red-deep), 0 0 18px var(--glow-soft)}
+.tile.fav{border-color:var(--accent-red); box-shadow:0 0 0 1px var(--accent-red), 0 0 22px var(--glow-medium)}
+
+.tile-foot{display:flex; align-items:center; justify-content:space-between; gap:var(--s2)}
+.tile-name{font-size:12px; color:var(--text-secondary); overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tile.on .tile-name,.tile.fav .tile-name{color:var(--text-primary)}
+.tile-score{font-size:11px; color:var(--text-faint); font-variant-numeric:tabular-nums}
+.tile-head{font-size:10px; color:var(--text-faint); height:24px; overflow:hidden}
+
+.star{
+  position:absolute; top:var(--s2); right:var(--s2);
+  width:26px; height:26px; border-radius:50%;
+  background:rgba(9,10,13,.72); border:1px solid var(--border-subtle);
+  color:var(--text-faint); font-size:13px; line-height:1;
+  display:flex; align-items:center; justify-content:center; padding:0;
+}
+.star:hover{color:var(--text-secondary); border-color:var(--border-medium)}
+.tile.fav .star{
+  color:var(--accent-red-bright); border-color:var(--accent-red-deep);
+  background:rgba(9,10,13,.9);
+}
+
+/* ---------- action bar ---------- */
+.actionbar{
+  display:flex; align-items:center; justify-content:space-between; gap:var(--s4);
+  padding:var(--s3) var(--s5);
+  background:var(--surface-1); border-top:1px solid var(--border-subtle);
+}
+
+/* ---------- toast ---------- */
+.toast{
+  position:fixed; left:50%; bottom:var(--s6); transform:translateX(-50%);
+  background:var(--surface-3); color:var(--text-primary);
+  border:1px solid var(--border-medium); border-left:2px solid var(--accent-red);
+  border-radius:6px; padding:var(--s3) var(--s4); font-size:12px;
+  box-shadow:0 8px 28px rgba(0,0,0,.5); max-width:min(560px,90vw);
+}
+.toast.err{border-left-color:var(--status-yellow)}
+
+@media (prefers-reduced-motion:reduce){
+  *{transition:none!important; animation:none!important}
+}
+
+/* ==========================================================================
+   Punch-list additions (2026-09-06)
+   ========================================================================== */
+
+/* ---------- how-to line + info button (item 2) ---------- */
+.howto{
+  display:flex; align-items:center; gap:var(--s3);
+  background:var(--surface-1); border:1px solid var(--border-subtle);
+  border-left:2px solid var(--accent-red-deep);
+  border-radius:8px; padding:var(--s3) var(--s4);
+}
+.howto-line{margin:0; font-size:12px; color:var(--text-secondary); flex:1}
+.howto-line b{color:var(--text-primary); font-weight:500}
+.info{
+  flex:0 0 auto; width:22px; height:22px; border-radius:50%; padding:0;
+  background:transparent; border:1px solid var(--border-medium);
+  color:var(--text-muted); font-size:11px; font-style:italic; font-weight:600;
+  line-height:1; display:flex; align-items:center; justify-content:center;
+}
+.info:hover{color:var(--text-primary); border-color:var(--accent-red-deep)}
+
+/* ---------- modal (item 2) ---------- */
+.modal{
+  position:fixed; inset:0; z-index:50;
+  background:rgba(5,6,9,.72);
+  display:flex; align-items:center; justify-content:center; padding:var(--s5);
+}
+.modal-box{
+  background:var(--surface-1); border:1px solid rgba(224,38,56,.18);
+  border-radius:var(--radius); width:min(680px,100%); max-height:82vh;
+  display:flex; flex-direction:column;
+  box-shadow:0 0 0 1px rgba(0,0,0,.5), 0 0 40px -8px var(--glow-medium);
+}
+.modal-head{
+  display:flex; align-items:center; justify-content:space-between;
+  padding:var(--s4); border-bottom:1px solid rgba(224,38,56,.14);
+  background:linear-gradient(180deg,rgba(224,38,56,.05),transparent);
+}
+.modal-head h2{
+  margin:0; font-size:13px; font-weight:500; letter-spacing:.01em;
+  text-transform:uppercase;
+}
+.modal-body{padding:var(--s4) var(--s5) var(--s5); overflow-y:auto}
+.modal-body h3{
+  margin:var(--s5) 0 var(--s2); font-size:12px; font-weight:500;
+  color:var(--accent-red-bright); letter-spacing:.02em;
+}
+.modal-body h3:first-child{margin-top:0}
+.modal-body p{margin:0; font-size:12px; color:var(--text-secondary); line-height:1.65}
+.modal-body b{color:var(--text-primary); font-weight:500}
+
+/* ---------- collapse (item 1) ---------- */
+.caret{
+  background:none; border:1px solid var(--border-medium); color:var(--text-muted);
+  width:26px; height:26px; padding:0; font-size:11px; line-height:1;
+  display:flex; align-items:center; justify-content:center;
+}
+.caret:hover{color:var(--text-primary); background:var(--surface-hover)}
+.caret span{display:block; transition:transform .15s}
+.card.collapsed .caret span{transform:rotate(-90deg)}
+/* Collapsing hides the tiles and the fail note but KEEPS the head row, so the
+   card still reads "5 shippable, saving otsu" while folded away. A collapsed
+   card that showed only a filename would make the user open it again just to
+   remember what they had decided. */
+.card.collapsed .strip,.card.collapsed .failnote{display:none}
+.card.collapsed{box-shadow:0 0 0 1px rgba(0,0,0,.4)}
+.card.collapsed .card-head{border-bottom:none}
+
+.actionbar-right{display:flex; align-items:center; gap:var(--s3)}
+
+/* ---------- update bar (item 6) ---------- */
+.updatebar{
+  display:flex; align-items:center; gap:var(--s3);
+  padding:var(--s2) var(--s5);
+  background:linear-gradient(90deg,rgba(224,38,56,.14),transparent);
+  border-bottom:1px solid rgba(224,38,56,.22);
+  font-size:12px; color:var(--text-secondary);
+}
+.updatebar a.ghost{text-decoration:none; padding:4px var(--s3); font-size:11px}
+.linkish{
+  background:none; border:none; color:var(--text-muted);
+  font-size:11px; padding:4px; text-decoration:underline;
+}
+.linkish:hover{color:var(--text-primary)}
+
+/* ---------- statistics (item 3) ---------- */
+.stats{display:flex; flex-direction:column; gap:var(--s5)}
+.statgroup{
+  background:var(--surface-1); border:1px solid var(--border-subtle);
+  border-radius:var(--radius); padding:var(--s4) var(--s5) var(--s5);
+}
+.statgroup > h2{
+  margin:0 0 var(--s1); font-size:12px; font-weight:500; text-transform:uppercase;
+  letter-spacing:.04em; color:var(--text-primary);
+}
+.statgroup > .sub{margin:0 0 var(--s4); font-size:11px; color:var(--text-muted); line-height:1.6}
+.bignums{display:flex; flex-wrap:wrap; gap:var(--s5); margin-bottom:var(--s5)}
+.bignum{min-width:132px}
+.bignum .v{
+  font-size:26px; font-weight:500; letter-spacing:-.02em;
+  color:var(--text-primary); font-variant-numeric:tabular-nums; line-height:1.15;
+}
+.bignum .v.good{color:var(--status-green)}
+.bignum .v.warn{color:var(--status-yellow)}
+.bignum .k{
+  font-size:10px; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--text-muted); margin-top:2px;
+}
+.bignum .d{font-size:10px; color:var(--text-faint); margin-top:2px}
+
+table.stat{width:100%; border-collapse:collapse; font-size:12px}
+table.stat th{
+  text-align:left; font-weight:500; font-size:10px; text-transform:uppercase;
+  letter-spacing:.05em; color:var(--text-muted);
+  padding:0 var(--s3) var(--s2) 0; border-bottom:1px solid var(--border-subtle);
+}
+table.stat td{
+  padding:6px var(--s3) 6px 0; color:var(--text-secondary);
+  border-bottom:1px solid rgba(255,255,255,.04); font-variant-numeric:tabular-nums;
+}
+table.stat td.name{color:var(--text-primary)}
+/* padding-LEFT, not just right: these columns are width:1% so they sit
+   flush against each other, and the headers ran together as one word
+   ("RATESTARRED"). */
+table.stat th.num,table.stat td.num{
+  text-align:right; padding-right:0; padding-left:var(--s5);
+  width:1%; white-space:nowrap;
+}
+.meter{
+  display:block; height:4px; width:110px; border-radius:2px;
+  background:var(--surface-3); overflow:hidden; margin-top:5px;
+}
+.meter i{display:block; height:100%; background:var(--accent-red); border-radius:2px}
+.demoted{opacity:.5}
+
+.share{
+  display:flex; flex-direction:column; gap:var(--s3);
+  border-top:1px solid var(--border-subtle); margin-top:var(--s5); padding-top:var(--s4);
+}
+.optin{display:flex; align-items:flex-start; gap:var(--s2); font-size:12px; color:var(--text-secondary)}
+.optin input{margin-top:2px; accent-color:var(--accent-red)}
+.share-actions{display:flex; gap:var(--s2); align-items:center; flex-wrap:wrap}
+#reportbox{
+  width:100%; min-height:150px; resize:vertical;
+  background:var(--bg-page-deep); color:var(--text-secondary);
+  border:1px solid var(--border-subtle); border-radius:6px;
+  padding:var(--s3); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+  font-size:11px; line-height:1.5;
+}
+
+/* ---------- full-size candidate viewer ---------- */
+.expand{
+  position:absolute; top:var(--s2); left:var(--s2);
+  width:26px; height:26px; border-radius:50%;
+  /* Nearly opaque, and a light glyph. The tile plate underneath is WHITE, so
+     a 72%-alpha chip over it reads as pale grey and swallowed a dark icon. */
+  background:rgba(9,10,13,.88); border:1px solid var(--border-medium);
+  color:var(--text-secondary); font-size:12px; line-height:1;
+  display:flex; align-items:center; justify-content:center; padding:0;
+  opacity:0; transition:opacity .12s, color .12s;
+}
+.tile:hover .expand,.tile:focus-within .expand{opacity:1}
+.expand:hover{color:var(--text-primary); border-color:var(--border-medium)}
+/* Always reachable by keyboard even though it is hover-revealed for the mouse. */
+.expand:focus-visible{opacity:1}
+
+.viewer{
+  position:fixed; inset:0; z-index:60; background:var(--bg-page-deep);
+  display:flex; flex-direction:column;
+}
+.viewer-bar{
+  display:flex; align-items:center; gap:var(--s3);
+  padding:var(--s3) var(--s4);
+  background:var(--surface-1); border-bottom:1px solid var(--border-subtle);
+}
+.v-title{font-size:13px; color:var(--text-primary); font-weight:500}
+.v-score{font-size:11px; color:var(--text-muted); font-variant-numeric:tabular-nums}
+.v-spacer{flex:1}
+#v-pick.on,#v-star.on{color:var(--accent-red-bright); border-color:var(--accent-red-deep)}
+
+.viewer-body{
+  flex:1; min-height:0; display:flex; gap:var(--s4); padding:var(--s4);
+}
+.v-pane{
+  flex:1; min-width:0; margin:0;
+  display:flex; flex-direction:column; gap:var(--s2);
+}
+/* White plate for the same reason the tiles use one: laser proofs are black
+   ink on white stock, and this view exists to judge the ink. */
+.v-plate{
+  flex:1; min-height:0; background:#fff; border-radius:8px;
+  display:flex; align-items:center; justify-content:center; overflow:hidden;
+}
+.v-plate img{max-width:100%; max-height:100%; object-fit:contain; display:block}
+.v-pane figcaption{
+  font-size:11px; color:var(--text-muted); text-align:center;
+  text-transform:uppercase; letter-spacing:.05em;
+}
+.viewer-foot{
+  display:flex; align-items:center; justify-content:center; gap:var(--s4);
+  padding:var(--s3); background:var(--surface-1);
+  border-top:1px solid var(--border-subtle);
+}
+@media (max-width:900px){ .viewer-body{flex-direction:column} }

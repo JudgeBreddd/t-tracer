@@ -1,0 +1,92 @@
+name: Build Windows installer
+
+# Builds T-Tracer-Setup.exe on a real Windows runner. This exists
+# because the installer cannot be built or tested on Linux, which is where the
+# project is developed.
+#
+# Push a tag like v0.1.0 and the .exe is attached to a GitHub Release. Run it
+# manually from the Actions tab to get a downloadable artifact without
+# publishing a release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write          # needed to attach the .exe to a Release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = if ($env:GITHUB_REF -like 'refs/tags/v*') {
+            $env:GITHUB_REF -replace '^refs/tags/v',''
+          } else { '0.0.0-dev' }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Version: $v"
+
+      # Catches syntax errors in the installer script before Inno Setup runs,
+      # so a broken PowerShell file fails in seconds rather than after a build.
+      - name: Syntax-check install.ps1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "app/install.ps1", [ref]$null, [ref]$errs) | Out-Null
+          if ($errs) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
+          Write-Host 'install.ps1 parses cleanly'
+
+      # The Python half is developed and tested on Linux; this proves it at
+      # least imports on Windows before we wrap it in an installer.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Import-check the pipeline on Windows
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip --quiet
+          python -m pip install --only-binary=pydantic-core --quiet `
+            -r requirements.txt -r app/requirements.txt
+          python -c "import sys; sys.path.insert(0,'app'); import server; print('server imports OK on Windows')"
+          python -c "import sys; sys.path.insert(0,'_scripts'); import candidates as c; print('strategies:', list(c.STRATEGIES))"
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          # Inno Setup is preinstalled on windows-latest images; install it if
+          # that ever stops being true rather than failing mysteriously.
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DAppVersion=${{ steps.ver.outputs.version }}" app\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed' }
+          Get-ChildItem dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: T-Tracer-Setup
+          path: dist/T-Tracer-Setup.exe
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/T-Tracer-Setup.exe
+          body: |
+            Download **T-Tracer-Setup.exe** below and run it.
+
+            It installs Python and PyTorch if they are not already on the
+            machine — about 2 GB on first install, downloaded from python.org
+            and PyPI. Later versions reuse them.
+
+            No admin rights required.

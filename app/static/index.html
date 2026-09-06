@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>T-Tracer</title>
+<!-- Without these the Chrome --app window falls back to a globe, because an
+     app window takes its taskbar icon from the page favicon and nothing else.
+     .ico first for Windows, .png for everyone else. -->
+<link rel="icon" href="icon.ico" sizes="any">
+<link rel="icon" type="image/png" href="icon.png">
+<link rel="apple-touch-icon" href="icon.png">
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#090A0D">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <h1>T-Tracer</h1>
+  </div>
+  <div class="dest">
+    <label for="dest">Save to</label>
+    <input id="dest" type="text" spellcheck="false" placeholder="choose a folder…">
+    <button id="browse" class="ghost" type="button">Browse</button>
+  </div>
+</header>
+
+<div id="updatebar" class="updatebar" hidden>
+  <span id="updatetext"></span>
+  <a id="updatelink" class="ghost" href="#" target="_blank" rel="noopener">Download</a>
+  <button id="updatedismiss" class="linkish" type="button">Not now</button>
+</div>
+
+<nav class="tabs" role="tablist">
+  <button id="tab-current" class="tab on" role="tab" aria-selected="true" type="button">Current</button>
+  <button id="tab-history" class="tab" role="tab" aria-selected="false" type="button">History</button>
+  <button id="tab-stats" class="tab" role="tab" aria-selected="false" type="button">Statistics</button>
+</nav>
+
+<main id="main">
+
+  <section id="history" class="history" hidden></section>
+  <section id="stats" class="stats" hidden></section>
+
+  <!-- Item 2: the two-step interaction is not guessable from the tiles alone.
+       One short line carries the whole job; the (i) opens the long version for
+       anyone who wants it. -->
+  <section id="howto" class="howto">
+    <p class="howto-line">
+      <b>Click every result you would actually send to a customer</b>, then
+      <b>star the one to save</b>. Only the starred one is written out.
+    </p>
+    <button id="infobtn" class="info" type="button"
+            aria-label="How this works" title="How this works">i</button>
+  </section>
+
+  <section id="drop" class="dropzone" tabindex="0" role="button"
+           aria-label="Add images">
+    <div class="drop-inner">
+      <p class="drop-title">Drop logos here</p>
+      <p class="drop-sub">PNG, JPG, WEBP, BMP, TIFF &middot; as many as you like</p>
+      <button id="browseImages" class="primary" type="button">Choose images</button>
+    </div>
+    <input id="file" type="file" accept="image/*" multiple hidden>
+  </section>
+
+  <section id="progress" class="progress" hidden>
+    <div class="bar"><span id="barfill"></span></div>
+    <p id="progresstext" class="meta">Tracing…</p>
+  </section>
+
+  <section id="results" class="results" hidden></section>
+
+</main>
+
+<footer id="actionbar" class="actionbar" hidden>
+  <p id="summary" class="meta"></p>
+  <div class="actionbar-right">
+    <button id="collapseall" class="ghost" type="button">Collapse all</button>
+    <button id="save" class="primary" type="button" disabled>Save favourites</button>
+  </div>
+</footer>
+
+<div id="modal" class="modal" hidden role="dialog" aria-modal="true"
+     aria-labelledby="modaltitle">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h2 id="modaltitle">How to use this</h2>
+      <button id="modalclose" class="close" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <h3>1. Drop your logos in</h3>
+      <p>Any number at once. Each one is traced seven different ways, because no
+         single method wins on every image &mdash; a method that nails a solid
+         badge will destroy fine linework, and the other way round.</p>
+
+      <h3>2. Click every result that would actually ship</h3>
+      <p>Not the best one &mdash; <b>all</b> of the good ones. Most logos have
+         several usable results, and clicking all of them is what lets the app
+         learn which methods are genuinely reliable. Clicking only one throws
+         that away.</p>
+
+      <h3>3. Star the one to keep</h3>
+      <p>The star marks the single result written to your folder. The
+         top-ranked result is starred for you as a starting guess; it is the
+         right choice about 8 times in 10, so change it whenever your eye
+         disagrees. Your eye wins.</p>
+
+      <h3>If none of them are any good</h3>
+      <p>Press <b>Nothing usable</b>. That is a real answer and it is worth
+         recording &mdash; being forced to star something you would never send
+         to a customer is worse than saving nothing. Roughly 1 logo in 14 beats
+         every method; those are the ones worth cleaning up first (crop tight,
+         raise contrast, flatten to solid black on white) or redrawing by hand.</p>
+
+      <h3>Saving</h3>
+      <p>Choose a folder in <b>Save to</b> at the top, then press
+         <b>Save favourites</b>. Every starred result is written there as an
+         SVG named after the original image. The folder is remembered for next
+         time.</p>
+
+      <h3>Getting a different one later</h3>
+      <p>Nothing is thrown away. <b>History</b> reopens any past run, so if the
+         file you saved turns out wrong on the machine you can come back and
+         grab a different method without re-tracing.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Full-size candidate viewer. The 150px tile is enough to rank a slate at a
+     glance and not enough to judge whether a hairline survived, which is the
+     actual decision. Shows the candidate beside the ORIGINAL rather than alone,
+     because "is this right" is always a comparison. -->
+<div id="viewer" class="viewer" hidden role="dialog" aria-modal="true"
+     aria-label="Candidate at full size">
+  <div class="viewer-bar">
+    <span id="v-title" class="v-title"></span>
+    <span id="v-score" class="v-score"></span>
+    <span class="v-spacer"></span>
+    <button id="v-pick" class="ghost" type="button">Mark shippable</button>
+    <button id="v-star" class="ghost" type="button">Star this one</button>
+    <button id="v-close" class="close" type="button" aria-label="Close">&times;</button>
+  </div>
+  <div class="viewer-body">
+    <figure class="v-pane">
+      <div class="v-plate"><img id="v-src" alt="original"></div>
+      <figcaption>Original</figcaption>
+    </figure>
+    <figure class="v-pane">
+      <div class="v-plate"><img id="v-img" alt="candidate at full size"></div>
+      <figcaption id="v-cap"></figcaption>
+    </figure>
+  </div>
+  <div class="viewer-foot">
+    <button id="v-prev" class="ghost" type="button">&larr; Previous</button>
+    <span id="v-pos" class="meta"></span>
+    <button id="v-next" class="ghost" type="button">Next &rarr;</button>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

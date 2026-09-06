@@ -1,0 +1,21 @@
+# App shell only. The tracing pipeline's own deps are in ../requirements.txt,
+# and the annotator's torch stack lives in its separate venv (see install.sh).
+#
+# Lower bounds, not exact pins, and these particular floors are the ones
+# VERIFIED installing as wheels on Python 3.14.7 (this machine).
+#
+# The first cut of this file carried exact pins written from memory. pydantic
+# 2.10's pydantic-core has no 3.14 wheel, so pip fell back to building it from
+# Rust and the install died in a 125-line PyO3 error about Python 3.14 being
+# newer than PyO3 supports. Floors let a newer interpreter find a newer wheel
+# instead of walking into the same wall.
+#
+# install.sh additionally passes --only-binary=pydantic-core. That is scoped on
+# purpose: it is the one dependency here that invokes a compiler, and a blanket
+# --only-binary=:all: would wrongly reject proxy_tools, a pure-Python sdist
+# pywebview needs.
+fastapi>=0.141.1
+uvicorn>=0.52.4
+python-multipart>=0.0.32
+pydantic>=2.13.5
+pywebview>=5.3.2

@@ -1,0 +1,13 @@
+fonttools==4.64.0
+ImageIO==2.37.4
+lazy-loader==0.5
+lxml==6.1.2
+networkx==3.6.1
+numpy==2.5.2
+opencv-python-headless==5.0.0.93
+packaging==26.3
+pillow==12.3.0
+scikit-image==0.26.0
+scipy==1.18.1
+svgelements==1.9.6
+tifffile==2026.8.23

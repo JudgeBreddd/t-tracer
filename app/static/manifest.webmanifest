@@ -1,0 +1,10 @@
+{
+  "name": "T-Tracer",
+  "short_name": "T-Tracer",
+  "description": "Turn a customer logo into a laser-ready SVG.",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#090A0D",
+  "theme_color": "#090A0D",
+  "icons": []
+}

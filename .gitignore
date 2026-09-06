@@ -1,0 +1,75 @@
+# ---------------------------------------------------------------------------
+# PRIVATE. None of this is ever published.
+#
+# The corpus is 178 real customer logos - military insignia, unit crests,
+# client artwork - and picks.jsonl records the reviewer's judgments on them. Both stay
+# on disk and out of the repo. The folder keeps everything; git tracks code.
+# ---------------------------------------------------------------------------
+_scripts/corpus/
+_scripts/candidates/
+_scripts/candidates-*/
+_scripts/batch*/
+_scripts/one/
+_scripts/test-*/
+_scripts/new to test/
+_scripts/converter script testers/
+_scripts/completed test/
+_scripts/retest/
+_scripts/_converted/
+_scripts/ab-test/
+_scripts/triage/sheets/
+_scripts/triage/*.png
+_scripts/triage/manifest.tsv
+_scripts/triage/corpus*.txt
+_scripts/triage/dupe-clusters.tsv
+_scripts/triage/deleted-photos.txt
+_scripts/triage/mask-sweep/
+# Caught by the pre-publish audit, not by planning: 31 more customer logos.
+_scripts/redgold/
+_scripts/*.png
+_scripts/*.jpg
+_scripts/*.jpeg
+_scripts/*.svg
+stages/01_intake/output/
+stages/06_deliverables/*.svg
+
+# Internal working notes. CLAUDE.md in particular is the decisions log - it
+# quotes the reviewer directly, names customer logos and carries business detail that
+# has no business in a public repo. README.md is the public face instead.
+CLAUDE.md
+CONTEXT.md
+HANDOFF-*.md
+mvp-run-notes.md
+PLANNING.md
+_archive/
+_intake/
+library/
+stages/
+
+# ---------------------------------------------------------------------------
+# Build products and caches
+# ---------------------------------------------------------------------------
+.venv/
+.venv-*/
+dist/
+build/
+__pycache__/
+*.pyc
+.lineart_cache/
+app/.work/
+app/.chrome-profile/
+app/T-Tracer
+app/T-Tracer.cmd
+.DS_Store
+
+# Internal working material - deliberately not published.
+# _scripts/triage/ is the corpus-building tooling: it hardcodes customer logo
+# filenames and reviewer quotes, is built around a private 600-file dump, and
+# deferred-work.md already recorded that it "does not ship".
+_scripts/triage/
+deferred-work.md
+*Punch list*.md
+
+# Dead code from the archived decompose route (stages 02-05). Referenced by
+# nothing that ships and describes a pipeline this repo no longer contains.
+_shared/scripts/
