@@ -47,14 +47,24 @@ function Find-Python {
         $exe = Get-Command $parts[0] -ErrorAction SilentlyContinue
         if (-not $exe) { continue }
         try {
-            $args = @()
-            if ($parts.Count -gt 1) { $args += $parts[1] }
-            $v = & $exe.Source @args -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>$null
+            # NOT $args - that's the automatic variable holding this function's
+            # own arguments, and shadowing it is a bug magnet even in a scope
+            # where it happens to work.
+            $verArgs = @()
+            if ($parts.Count -gt 1) { $verArgs += $parts[1] }
+            # Double quotes embedded in a single-quoted native-exe argument get
+            # silently stripped by PowerShell 5.1's argument re-quoting, which
+            # turned "%d.%d" % sys.version_info[:2] into a Python SyntaxError -
+            # every candidate "failed" and Find-Python always returned $null,
+            # even with a perfectly good Python already on PATH. An f-string
+            # inside a double-quoted PowerShell string (no embedded double
+            # quotes) survives the round trip.
+            $v = & $exe.Source @verArgs -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null
         } catch { continue }
         if (-not $v) { continue }
         $mm = $v.Trim().Split('.')
         if ([int]$mm[0] -eq 3 -and [int]$mm[1] -ge 10 -and [int]$mm[1] -le 13) {
-            return @{ Exe = $exe.Source; Args = $args; Version = $v.Trim() }
+            return @{ Exe = $exe.Source; Args = $verArgs; Version = $v.Trim() }
         }
     }
     return $null
