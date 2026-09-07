@@ -47,6 +47,33 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(APP_DIR))
 
+# pythonw.exe (a GUI-subsystem executable - what every shortcut here launches,
+# and what "no console window" requires) has NO console at all unless
+# something redirects it, and CPython then sets sys.stdout/sys.stderr to
+# None rather than a no-op stream. A bare print() under that condition raises
+# AttributeError: 'NoneType' object has no attribute 'write' - instantly, with
+# no console to show it, so the whole process dies before doing anything
+# visible. Found the hard way: this is what "the app opens and then closes"
+# (or "nothing happens at all") turned out to actually be, once Chrome/Edge
+# became the default Windows window backend and its one print() call sat on
+# that path unconditionally. Route every write in this file through here
+# instead of the stdlib streams directly, and give both a real sink up front
+# so nothing else - server.py, a library, a future print - can hit the same
+# crash by writing to sys.stdout/sys.stderr elsewhere in the process.
+if sys.stdout is None or sys.stderr is None:
+    import os
+    _devnull = open(os.devnull, 'w')                        # noqa: SIM115
+    sys.stdout = sys.stdout or _devnull
+    sys.stderr = sys.stderr or _devnull
+
+
+def log(*args, **kwargs) -> None:
+    """print(), but safe under pythonw with no console (see the guard above)."""
+    try:
+        print(*args, **kwargs)
+    except Exception:                                        # noqa: BLE001
+        pass
+
 
 def free_port() -> int:
     with socket.socket() as s:
@@ -131,7 +158,7 @@ def main() -> int:
 
     url = f'http://127.0.0.1:{port}/'
     if not wait_for(port):
-        print(f'Backend did not start. Try: python server.py', file=sys.stderr)
+        log(f'Backend did not start. Try: python server.py', file=sys.stderr)
         return 1
 
     def run_webview() -> int:
@@ -157,7 +184,7 @@ def main() -> int:
         # flow when it exists.
         (profile / 'First Run').touch(exist_ok=True)
 
-        print('Opening in an app window…')
+        log('Opening in an app window…')
         subprocess.run([
             chrome, f'--app={url}',
             f'--user-data-dir={profile}',
@@ -182,8 +209,8 @@ def main() -> int:
         return run_chrome(chrome)
 
     import webbrowser
-    print(f'No app-window backend found - opening a browser tab: {url}')
-    print('Close this terminal window to quit.')
+    log(f'No app-window backend found - opening a browser tab: {url}')
+    log('Close this terminal window to quit.')
     webbrowser.open(url)
     try:
         threading.Event().wait()

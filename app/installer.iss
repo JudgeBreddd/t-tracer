@@ -55,6 +55,11 @@ Source: "..\app\*";           DestDir: "{app}\app";      Flags: ignoreversion re
     Excludes: "*.pyc,__pycache__\*,.work\*,.chrome-profile\*,T-Tracer,T-Tracer.cmd"
 Source: "..\_scripts\*.py";   DestDir: "{app}\_scripts"; Flags: ignoreversion
 Source: "..\requirements.txt"; DestDir: "{app}";         Flags: ignoreversion
+; server.py reads this at runtime as APP_VERSION - the single source of truth
+; the app's own version display and the update checker are built from. The
+; release workflow overwrites this file with the tag before invoking ISCC, so
+; this and {#AppVersion} below can never drift apart the way they used to.
+Source: "..\VERSION";          DestDir: "{app}";         Flags: ignoreversion
 Source: "..\_shared\laser-output-rules.md"; DestDir: "{app}\_shared"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Run]
