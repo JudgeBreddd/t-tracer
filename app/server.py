@@ -494,14 +494,46 @@ def pick_folder():
     """Native folder chooser, server-side.
 
     The pywebview bridge only exists when pywebview is the window backend, and
-    on Linux it usually is not (no GTK/Qt renderer - see main.py). Doing it here
-    means Browse works the same in a Chrome app window as in a native one.
-    tkinter would be the obvious choice and is deliberately not used: it is
-    present but broken on this machine (missing libtk8.6), which is exactly the
-    kind of thing that turns a button into a crash.
+    that is no longer the default on either Linux (no GTK/Qt renderer) or
+    Windows (Chrome/Edge --app mode is now first choice there - see main.py).
+    Doing it here means Browse works the same regardless of which window
+    backend actually rendered the page.
+    tkinter would be the obvious cross-platform choice and is deliberately not
+    used on Linux: it is present but broken on that machine (missing
+    libtk8.6), which is exactly the kind of thing that turns a button into a
+    crash. On Windows it ships with the standard python.org installer, so it
+    is tried there; PowerShell's own folder dialog is the fallback for a
+    Python build that dropped it.
     """
     import shutil
     import subprocess
+
+    if sys.platform == 'win32':
+        try:
+            import tkinter
+            from tkinter import filedialog
+            root = tkinter.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            path = filedialog.askdirectory()
+            root.destroy()
+            return {'path': path or None}
+        except Exception:                                  # noqa: BLE001
+            pass
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms | Out-Null;"
+            "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
+            "if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }"
+        )
+        try:
+            r = subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps_script],
+                capture_output=True, text=True, timeout=180,
+            )
+        except Exception:                                  # noqa: BLE001
+            return {'path': None, 'unavailable': True}
+        return {'path': r.stdout.strip() or None}
+
     for cmd in (['kdialog', '--getexistingdirectory', str(Path.home())],
                 ['zenity', '--file-selection', '--directory']):
         if not shutil.which(cmd[0]):
