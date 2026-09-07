@@ -7,11 +7,11 @@ opens it in a real application window.
 THREE WINDOW BACKENDS, tried in order, because none of them is available
 everywhere:
 
-1. **pywebview** - wraps the OS's own webview. Ideal on Windows (WinForms) and
-   macOS (Cocoa), where a backend always exists.
-2. **Chrome/Chromium in --app mode** - a chromeless standalone window: no tabs,
+1. **Chrome/Edge in --app mode** - a chromeless standalone window: no tabs,
    no address bar, its own taskbar entry. Indistinguishable from a native app
-   window for this purpose.
+   window for this purpose, and the DEFAULT on Windows (see below).
+2. **pywebview** - wraps the OS's own webview. Used on macOS (Cocoa), and as
+   a last resort on Windows if no Chromium browser is found at all.
 3. **The default browser** - a normal tab. Ugly but functional; better than
    refusing to start.
 
@@ -22,6 +22,19 @@ succeeds on a bare Linux box and then `webview.start()` has nothing to render
 into, so the app appears to launch and simply never opens a window. That is
 exactly what happened on this machine. Detecting the backend BEFORE trying to
 use it turns a silent hang into a working window.
+
+**Windows-specific reason pywebview is no longer tried first, found on a real
+install:** pywebview's WinForms host window hit a documented upstream bug
+where Windows 11's Snap Layout hover triggers infinite recursion walking the
+window's accessibility tree (`window.native.AccessibilityObject.Bounds.Empty.
+Empty...` -> `RecursionError`). pywebview swallows the error per-event rather
+than raising it, so nothing here can catch it - the window silently fails to
+render (or renders and then vanishes) while the Python process and its local
+server keep running orphaned in the background. Reported as "it opens and
+then closes." Chrome/Edge `--app` mode hosts its own window and never touches
+pywebview's WinForms code at all, which is why it moved to first choice on
+Windows - every Windows 10/11 machine ships Edge, so this is not a
+"hope a browser is installed" fallback the way it is on Linux.
 """
 from __future__ import annotations
 
@@ -71,10 +84,14 @@ def _has_webview_backend() -> bool:
 
 
 def find_chrome() -> str | None:
-    """A Chromium-family browser that supports --app windows."""
+    """A Chromium-family browser that supports --app windows.
+
+    Edge is checked because it ships with every Windows 10/11 install - this
+    is the primary Windows path now, not a last-resort guess.
+    """
     import shutil
     names = ['google-chrome-stable', 'google-chrome', 'chromium',
-             'chromium-browser', 'brave-browser', 'microsoft-edge']
+             'chromium-browser', 'brave-browser', 'microsoft-edge', 'msedge']
     for n in names:
         p = shutil.which(n)
         if p:
@@ -85,6 +102,8 @@ def find_chrome() -> str | None:
         '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
         r'C:\Program Files\Google\Chrome\Application\chrome.exe',
         r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
+        r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe',
+        r'C:\Program Files\Microsoft\Edge\Application\msedge.exe',
     ]
     return next((p for p in fixed if Path(p).exists()), None)
 
@@ -115,7 +134,7 @@ def main() -> int:
         print(f'Backend did not start. Try: python server.py', file=sys.stderr)
         return 1
 
-    if _has_webview_backend():
+    def run_webview() -> int:
         import webview
         api = Api()
         api.window = webview.create_window(
@@ -126,8 +145,7 @@ def main() -> int:
         webview.start()
         return 0
 
-    chrome = find_chrome()
-    if chrome:
+    def run_chrome(chrome: str) -> int:
         import subprocess
         profile = APP_DIR / '.chrome-profile'      # keeps it out of the user's
         profile.mkdir(exist_ok=True)               # normal Chrome session
@@ -151,6 +169,17 @@ def main() -> int:
             '--disable-features=Translate,ChromeWhatsNewUI',
         ], stderr=subprocess.DEVNULL)
         return 0
+
+    # Windows tries Chrome/Edge FIRST - see the module docstring for why
+    # pywebview's WinForms host is not trusted there. Every other platform
+    # keeps the original preference: pywebview when it can actually render.
+    chrome = find_chrome()
+    if sys.platform == 'win32' and chrome:
+        return run_chrome(chrome)
+    if _has_webview_backend():
+        return run_webview()
+    if chrome:
+        return run_chrome(chrome)
 
     import webbrowser
     print(f'No app-window backend found - opening a browser tab: {url}')
