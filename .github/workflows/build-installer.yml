@@ -32,6 +32,14 @@ jobs:
           "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Version: $v"
 
+          # The VERSION file ships inside the installer and is what the running
+          # app reads as its own version (server.py APP_VERSION) - overwriting
+          # it here, from the same tag Inno Setup's AppVersion below is built
+          # from, is what keeps the two from drifting apart again. They used to
+          # be set independently and a real install shipped v0.1.1 while the
+          # app itself kept reporting 0.1.0.
+          Set-Content -Path VERSION -Value $v -NoNewline
+
       # Catches syntax errors in the installer script before Inno Setup runs,
       # so a broken PowerShell file fails in seconds rather than after a build.
       - name: Syntax-check install.ps1

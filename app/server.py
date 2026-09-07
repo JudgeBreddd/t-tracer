@@ -61,7 +61,22 @@ import candidates as C                                   # noqa: E402
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff'}
 
-APP_VERSION = '0.1.0'
+# One VERSION file at the repo root is the single source of truth - the
+# installer's own AppVersion and this string used to be set independently
+# (a hardcoded literal here vs. the git tag passed to Inno Setup) and drifted:
+# a machine on installer v0.1.1 kept reporting "0.1.0" in the app itself,
+# which is exactly the kind of thing that makes the update checker lie.
+# installer.iss ships this file next to {app} (one level above app/, same
+# place requirements.txt lands); the release workflow overwrites it with the
+# tag being built, so both numbers can only ever come from that one push.
+def _read_app_version() -> str:
+    try:
+        return (Path(__file__).resolve().parent.parent / 'VERSION').read_text().strip()
+    except OSError:
+        return '0.0.0-dev'                                   # running from source, untagged
+
+
+APP_VERSION = _read_app_version()
 # Update checks ask GitHub about this repo. Overridable so a fork does not
 # report someone else's releases as its own updates.
 import os as _os
