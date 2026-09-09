@@ -125,7 +125,13 @@ def parse_choice(ans, n, names=None):
         picks = [i for i in range(1, n + 1) if i not in drop]
         return picks or None
     out = []
-    for part in ans.split(','):
+    # Split on commas AND whitespace. Splitting on commas alone meant a range
+    # could not be mixed with anything else: `1-4 6, 8` tokenised as
+    # ['1-4 6', ' 8'], the first chunk matched neither a range nor a name, and
+    # the whole answer was rejected with a hint that lists both forms as valid.
+    # Tyler hit exactly that on 2026-09-08 and it stalled a picking session.
+    # No strategy name contains a space, so this is safe.
+    for part in ans.replace(',', ' ').split():
         part = part.strip()
         if not part:
             continue
@@ -170,8 +176,8 @@ def review(stem, out_dir, redo=False):
     print('   0. none of these are shippable')
     print('   s. skip   q. quit')
     print('  Enter EVERY shippable one, best first. Numbers or names:')
-    print('    3  |  1,2,3  |  otsu,bgdist  |  1-4  |  all  |  all -6  '
-          '|  all except otsu')
+    print('    3  |  1,2,3  |  1-4 6 8  |  otsu,bgdist  |  1-3 otsu  '
+          '|  all  |  all -6  |  all except otsu')
 
     while True:
         try:
@@ -220,7 +226,8 @@ def review(stem, out_dir, redo=False):
                      if len(names) > 1 else '')
             print(f'  recorded: {name}  ->  {dst}{extra}')
             return name
-        print('  ? enter e.g. 3 | 1,2,3 | 1-4 | all | all -6 | 0 | s | q')
+        print('  ? enter e.g. 3 | 1,2,3 | 1-4 6 8 | otsu | all | all -6 '
+              '| 0 | s | q')
 
 
 def main():
