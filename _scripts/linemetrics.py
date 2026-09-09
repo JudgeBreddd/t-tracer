@@ -156,7 +156,7 @@ def contour_waviness(pts, sigma_small=2.0, window=120, step=None,
     laid over a rope bead or a hatching tick wraps most of the way around a
     small closed blob, and no quadratic can follow a loop -- so the window
     scored high for being a SHAPE rather than for being wavy. Measured on the
-    snake star: the beaded rope and the snake scales lit up as hard as the USN
+    the star-and-anchor emblem: the beaded rope and the snake scales lit up as hard as the a line-art emblem
     letterforms, which is a false positive on intended detail.
 
     A run that is meant to read as a line barely turns. A bead turns through
@@ -233,7 +233,7 @@ def measure_waviness(ink, sigma_small=2.0, window=120, corner_deg=35.0,
     # THE HEADLINE IS p90, NOT THE MEAN. Tyler rejects on the worst visible
     # defect, never on an average: "if the strait line on the letter A is wavy
     # its not shipping." One bad run kills the part, and a mean over a busy
-    # emblem buries it -- on the snake star the worst straight run is 5.3px
+    # emblem buries it -- on the the star-and-anchor emblem the worst straight run is 5.3px
     # while the mean is 0.26px. p90 rather than max so a single stray window
     # cannot decide a part on its own.
     return {
@@ -407,7 +407,7 @@ def summarise_runs(runs, bulge_flag=1.6):
 # THE MISUNDERSTANDING THAT COST THE DAY, and it was a real one on both sides:
 # Tyler kept saying "wavy". He meant THE BOUNDARY WHERE BLACK MEETS WHITE looks
 # uneven. I built a tool that measures whether the CENTRELINE of a run wanders.
-# Same word, two different objects. His three circled defects on ATI Insignia
+# Same word, two different objects. His three circled defects on the winged-roundel emblem
 # were, measured:
 #
 #   * the ellipse's upper stroke SWELLING from ~15px to ~25px along its length,
@@ -503,7 +503,7 @@ def _junction_mask(skel, dist, reach=1.6):
 
     Where two strokes meet, the largest inscribed circle is genuinely bigger
     than either stroke - that is what a junction IS, not a tracing defect.
-    Measured on ATI Insignia: the wing feathers join the wing body at dozens of
+    Measured on the winged-roundel emblem: the wing feathers join the wing body at dozens of
     junctions and every one read as a swelling, scoring 1.81 in regions Tyler
     called clean while his actual defects scored 1.39-1.74. Judging junctions
     as line width does not just add noise, it inverts the ranking.
@@ -707,7 +707,7 @@ def measure_bulge(ink, both_polarities=True, radius_mult=4.0):
     radius, which is literally "is this bit fatter than the line it is part of".
 
     Both polarities, because a white channel changing width reads as a defect
-    exactly as a black stroke does - that is the S in USN.
+    exactly as a black stroke does - that is a letterform.
     """
     from skimage.morphology import medial_axis
     ink = np.asarray(ink).astype(bool)

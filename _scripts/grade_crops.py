@@ -6,7 +6,7 @@ checked against Tyler's eye instead of against three regions Claude guessed.
 
 Why this exists. Five different width/waviness measures were built on 2026-09-08.
 Every one passed its synthetics and every one failed to separate the three spots
-Tyler circled on ATI Insignia from the spots he did not. The regions being
+Tyler circled on the winged-roundel emblem from the spots he did not. The regions being
 tested were BOXES CLAUDE DREW after reading circles off a compressed screenshot
 - so a disagreement could equally mean the metric was wrong or the boxes were.
 No amount of tuning resolves that, and tuning against three guessed boxes is

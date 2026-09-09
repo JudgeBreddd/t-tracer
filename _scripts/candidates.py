@@ -155,7 +155,7 @@ def load_source(img_path, work_dim=0):
     # names -- convert('RGBA') expands palette transparency into a true alpha,
     # so a 'P'-mode PNG needs the composite despite reporting no 'A' band.
     # Skipping it let transparent pixels come through as their underlying
-    # palette colour: 649,189 wrong pixels on vx-20-emblem-seeklogo.png, the
+    # palette colour: 649,189 wrong pixels on a palette-mode PNG in the corpus, the
     # exact failure flatten_to_white was written to prevent.
     if int(alpha.min()) == 255:
         rgb = np.array(rgba.convert('RGB'))
@@ -487,7 +487,7 @@ def strat_keyline(rgb, alpha=None, l_black=20.0, lab_tol=14.0, ring=True):
        probe forced. It is computed on the FLATTENED image, because on raw
        thread texture the silhouette fragments and the ring came back as
        stipple over the whole design. And its radius scales with the image
-       instead of being a fixed 5x5: on the 199px KESTRELS patch a fixed 5x5
+       instead of being a fixed 5x5: on the 199px patch a fixed 5x5
        is proportionally enormous, `clean_mask`'s protected close then filled
        every white channel it created, ink went 51.5% -> 68.1% and the bird
        disappeared. That is the FIFTH instance of this project's oldest
@@ -547,7 +547,7 @@ def _thicken_thin(ink, floor_px, keep_frac=0.5):
     A blanket dilation is the wrong instrument and this project has already
     paid for finding that out twice: it grows what is ALREADY thick enough and
     closes the white channels between neighbours, which is how a fixed 5x5 ring
-    erased the KESTRELS bird. So distance-transform the ink, take only the
+    erased the patch bird. So distance-transform the ink, take only the
     pixels whose stroke half-width is under the floor, and dilate those.
     """
     if floor_px < 1:
@@ -588,7 +588,7 @@ def _grow_counters(mask, min_px):
     """Grow NESTED ink islands -- letter counters -- to a minimum visible size.
 
     The counter-side twin of the stroke floor, and it exists because of one
-    measurement. Tyler on the KESTRELS patch: *"silhouette is right there. i
+    measurement. Tyler on the small patch: *"silhouette is right there. i
     mean right there. its missing the dot in the A in VFA."* Zooming the source
     to individual pixels, **that counter is ONE PIXEL** -- the source is
     199x254 and the whole letter is about 15px tall.
@@ -638,7 +638,7 @@ def _flip_fields(ink, min_field_frac=0.02, min_knock_frac=0.05, ring_px=2,
     """Turn a filled field inside-out: field goes bare, its outline stays as a
     stroke, and whatever was knocked out of it becomes the ink.
 
-    Tyler's verdict rejecting `keyline` on the KESTRELS patch, verbatim, and it
+    Tyler's verdict rejecting `keyline` on the small patch, verbatim, and it
     is the whole specification: *"lost the shield outline. words look rough.
     background should be white. bird black."* `keyline` burns the navy disc
     solid because the disc IS black paint, so the white bird comes back as a
@@ -677,7 +677,7 @@ def _flip_fields(ink, min_field_frac=0.02, min_knock_frac=0.05, ring_px=2,
     #
     # Measured core share -- the fraction of a blob further than `core_r` from
     # its own edge -- separates the two cleanly:
-    #     KESTRELS disc 73.3%, its two banners 59.2% and 50.3%   (fields)
+    #     the small patch disc 73.3%, its two banners 59.2% and 50.3%   (fields)
     #     USN vector's stroke network                    25.5%   (not a field)
     # 0.40 sits in that 24.8-point gap and states the rule in words: a field is
     # more than half solid, a stroke network is not. n=3 blobs against 1, so
@@ -1818,7 +1818,7 @@ def run_one(img_path, out_root, args):
     # tracer ever sees it. The anti-aliased edges in the source carry sub-pixel
     # information about where that curve actually runs, and thresholding at
     # native size throws it away. Upsampling first recovers it: measured on
-    # that image, `KESTRELS` and `VFA-137` go from ragged to clean.
+    # that image, the lettering go from ragged to clean.
     #
     # DEFAULT 0 (OFF), and that is deliberate rather than timid. 11 of the 82
     # images with a recorded pick are under 800px, so turning this on by

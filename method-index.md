@@ -145,7 +145,7 @@ colour.
 **Known defect:** decides per pixel against a *global* Otsu of its own distance
 map, which puts red back on the background side — the failure it was built to fix.
 
-## keyline — 4 picks (shipped the USN vector)
+## keyline — 4 picks (shipped a line-art emblem)
 
 1. **Bilateral filter twice** (d=9, σ=75/75) — flatten shading before thresholding
 2. `dark = _lightness(flat) < l_black`
