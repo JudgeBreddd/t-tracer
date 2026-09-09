@@ -354,7 +354,27 @@ def score(rendered, src_gray, paths, nodes, height_mm=None, ss=2, src_h=None,
     # negative and hide the others -------------------------------------------
     p_strays = min(25.0, comps['strays'] * 3.0 + comps['stray_area_frac'] * 300)
     p_gaps = min(25.0, gaps['gaps'] * 4.0)
-    p_jag = min(25.0, max(0.0, (jag_px - 0.08)) * 90)
+    # JAGGEDNESS CAP RAISED 25 -> 40, 2026-09-08, from 287 hand-labelled crops.
+    #
+    # This is the first weight in this file set from measured ground truth
+    # rather than judgement. Tyler graded 300 crops across 10 traces he had
+    # previously rejected; of the eight measurements available, jaggedness was
+    # far and away the best predictor of his defect calls:
+    #
+    #     jaggedness  AUC 0.822      ink fraction AUC 0.257 (inverted)
+    #     components  AUC 0.704      width cv     AUC 0.637
+    #     bulge       AUC 0.585      waviness     AUC 0.565  (both chance)
+    #
+    # The slope and the 0.08 dead zone were already right: defect crops score a
+    # median 20.6 points against 5.4 for clean ones. The CAP was not. It
+    # saturated at 0.358px and 33% OF DEFECT CROPS SAT AT OR PAST IT, so the
+    # worst third of real defects all collapsed to one value and could not be
+    # ranked against each other. Defect crops run to a p90 of 0.428px.
+    #
+    # 40 puts the saturation point at 0.524px, above the observed defect range,
+    # so the whole distribution stays orderable. Slope and dead zone unchanged
+    # deliberately - one measured defect, one change.
+    p_jag = min(40.0, max(0.0, (jag_px - 0.08)) * 90)
     p_xing = min(15.0, xing['self_intersecting_paths'] * 7.5)
     # Fusion is weighted heavily: it is the one defect that looks clean.
     #

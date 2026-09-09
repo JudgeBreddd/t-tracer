@@ -73,3 +73,22 @@ deferred-work.md
 # Dead code from the archived decompose route (stages 02-05). Referenced by
 # nothing that ships and describes a pipeline this repo no longer contains.
 _shared/scripts/
+
+# ---------------------------------------------------------------------------
+# Customer artwork. NEVER published.
+#
+# _inbox/ is Tyler's drop zone for new customer images - failures to work on,
+# jobs to test. Transient: images move out to _scripts/corpus/ if they become
+# calibration material, or are deleted once the job is done. See _inbox/README.md.
+#
+# The bare /*.png etc. rules are a SAFETY NET, not the intended path. Tyler
+# drops images in the project root by habit (twice on 2026-09-07), and a
+# customer logo reaching the public repo is the one unrecoverable mistake this
+# project can make. Belt and braces on purpose.
+# ---------------------------------------------------------------------------
+_inbox/
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+/*.bmp

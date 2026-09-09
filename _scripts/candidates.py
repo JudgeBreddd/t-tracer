@@ -62,6 +62,115 @@ IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 
 
 # ---------------------------------------------------------------------------
+# Source loading
+#
+# The source used to be DECODED TWICE and buffered five times over before the
+# `--max-dim` resize ever ran. On the two 12396x12396 USMC images in the
+# calibration set that is ~3.5 GB of peak allocation for ONE image, and workers
+# multiply it. Measured, per full-size RGBA buffer, on those: 614 MB.
+#
+#   raw.convert('RGBA') -> np.array(...)[:, :, 3]   the [:,:,3] is a VIEW, so
+#                                                   the whole RGBA array stays
+#                                                   alive just to hold alpha
+#   flatten_to_white(path)                          opens and decodes AGAIN,
+#                                                   then Image.new + composite
+#                                                   + convert = 3 more buffers
+#
+# One decode, alpha copied out so the big buffer can be freed, and the same
+# `Image.alpha_composite` call as before so the pixels are provably unchanged.
+#
+# The megapixel cap is an ABSURDITY guard, not a working limit. 200 MP is set
+# above the largest real calibration image (134 MP) on purpose: a cap that
+# rejects ground truth would quietly invalidate rows in picks.jsonl. Override
+# with TT_MAX_MEGAPIXELS.
+# ---------------------------------------------------------------------------
+
+MAX_MEGAPIXELS = max(1.0, float(os.environ.get('TT_MAX_MEGAPIXELS', '200')))
+
+
+def _align_pillow_limit():
+    """Pillow's own bomb guard warns at 89.5 MP and raises at 2x that, which is
+    both noisier and looser than ours. Point it at the same number so there is
+    one limit, not two that disagree."""
+    from PIL import Image
+    Image.MAX_IMAGE_PIXELS = int(MAX_MEGAPIXELS * 1_000_000)
+
+
+_align_pillow_limit()
+
+
+class SourceTooLarge(ValueError):
+    """Raised before any decode, so the pixels are never allocated."""
+
+
+def load_source(img_path, work_dim=0):
+    """Return (rgb_HxWx3, alpha_HxW or None), resized to `work_dim` FIRST.
+
+    RESIZE IS STEP ONE. Everything downstream then runs at one agreed size
+    instead of each stage picking its own -- which is what produced a pipeline
+    that downscaled to 2048, then to 1024 for the annotator, then supersampled
+    x6, then resampled x2 again for scoring.
+
+    Doing it here rather than in run_one is the memory fix as well as the
+    architecture fix. The 134 MP USMC sources needed ~3.2 GB of full-size
+    buffers to produce a 2048px working image, because the composite ran before
+    the resize. Resizing first, the only full-size allocation left is the decode
+    itself, and JPEG sources avoid even that.
+
+    `work_dim` 0 keeps the original size (current default, nothing changes).
+    """
+    from PIL import Image
+    with Image.open(img_path) as probe:
+        w, h = probe.size
+        fmt = probe.format
+    if w * h > MAX_MEGAPIXELS * 1_000_000:
+        raise SourceTooLarge(
+            f'{w}x{h} = {w * h / 1e6:.1f} MP exceeds the {MAX_MEGAPIXELS:.0f} MP '
+            f'limit ({fmt}). Raise TT_MAX_MEGAPIXELS to allow it.')
+
+    with Image.open(img_path) as im:
+        # Which alpha to RETURN is decided by the band names, exactly as before.
+        # A palette PNG carrying `transparency` in info reports bands ('P',) and
+        # returns None here even though it is genuinely transparent. That is
+        # pre-existing behaviour the strategies are calibrated against.
+        report_alpha = 'A' in im.getbands()
+        # JPEG only: ask libjpeg to decode at 1/2, 1/4 or 1/8 scale directly.
+        # The full-size buffer is then never allocated at all.
+        if work_dim and fmt == 'JPEG':
+            im.draft('RGB', (work_dim, work_dim))
+        rgba = im.convert('RGBA')
+
+    # THE RESIZE. Before the composite, before anything.
+    if work_dim and max(rgba.size) != work_dim:
+        sc = work_dim / max(rgba.size)
+        tgt = (max(1, round(rgba.width * sc)), max(1, round(rgba.height * sc)))
+        # BOX on the way down, BICUBIC on the way up. Matches the cv2
+        # INTER_AREA / INTER_LANCZOS4 split the pipeline already used, and
+        # avoids the aliasing a plain BICUBIC downscale leaves on fine art.
+        rgba = rgba.resize(tgt, Image.BOX if sc < 1 else Image.BICUBIC)
+
+    alpha = np.array(rgba.getchannel('A'))
+
+    # Whether to COMPOSITE is asked of the real alpha channel, never the band
+    # names -- convert('RGBA') expands palette transparency into a true alpha,
+    # so a 'P'-mode PNG needs the composite despite reporting no 'A' band.
+    # Skipping it let transparent pixels come through as their underlying
+    # palette colour: 649,189 wrong pixels on vx-20-emblem-seeklogo.png, the
+    # exact failure flatten_to_white was written to prevent.
+    if int(alpha.min()) == 255:
+        rgb = np.array(rgba.convert('RGB'))
+        rgba.close()
+        return rgb, (alpha if report_alpha else None)
+
+    bg = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+    flat = Image.alpha_composite(bg, rgba)
+    bg.close(); rgba.close()
+    rgb = np.array(flat.convert('RGB'))
+    flat.close()
+    return rgb, (alpha if report_alpha else None)
+
+
+# ---------------------------------------------------------------------------
 # Binarization strategies
 #
 # Each returns a boolean mask where True == INK (the geometry that ends up in
@@ -327,6 +436,312 @@ def _silhouette_of(rgb, alpha=None, lab_tol=14.0):
         return alpha > 128
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     return np.linalg.norm(lab - _background_color(lab), axis=2) > lab_tol
+
+
+def _lightness(rgb):
+    """CIELAB L* on a real 0..100 scale. OpenCV packs L into 0..255."""
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)[..., 0] * (100.0 / 255.0)
+
+
+def strat_keyline(rgb, alpha=None, l_black=20.0, lab_tol=14.0, ring=True):
+    """Recover the black line drawing the colour was poured into.
+
+    THE PREMISE, and it is a claim about how this artwork is MADE rather than
+    about pixels. Vector-derived insignia are not colour fields that happen to
+    have edges -- they are a line drawing that was then colour-filled. The
+    artist outlined every element in near-black and poured colour inside. If
+    that is true then the drawing is still in the file, and the ink-vs-field
+    question never has to be answered: every colour is fill, and fill is bare.
+
+    WHY THIS IS NOT A THIRD THRESHOLD VARIANT. `inotsu` and `triotsu` both
+    failed by MOVING the split -- a different cut through the same population,
+    which the 2026-09-06 finding proved cannot work, because the same
+    mid-luminance gold is INK on one logo and a FIELD on another and no cut
+    over any population separates them. This does not move a split. It asks an
+    absolute perceptual question with no reference to the image's own
+    histogram: "is this paint actually black?" A data-derived cut must land
+    somewhere between the modes. An absolute anchor need not land anywhere at
+    all, and on art with no black in it, it correctly returns nothing.
+
+    Measured on the two 2026-09-07 order failures before any of this was built:
+        pixels below L*20      17.5% (vector)   14.1% (embroidery)
+        pixels `otsu` burns      ~40%             ~44%
+    `otsu` was burning the fills AND the keylines together.
+
+    THREE PARTS, and each one was earned by a failure in the probe:
+
+    1. FLATTEN FIRST (bilateral, twice). The remaining defects after the bare
+       threshold were both shading, not classification: the airbrushed gradient
+       at the bottom of each USN letter dips below the anchor and burns as a
+       black wedge INSIDE the letter, and the embroidered patch's thread
+       texture breaks its navy star outline into dashes. Both are one piece of
+       paint whose lightness varies, and flattening is the operation that says
+       so -- `nested`'s "is this the same paint" question asked BEFORE the
+       threshold instead of after it. Measured: path count fell 2-7x
+       (embroidery 1027 -> 142, vector 413 -> 198).
+
+    2. SILHOUETTE RING, scaled to the image. A shape whose outer edge carries
+       no keyline still needs one -- the embroidered patch's red star sits
+       directly on white and came out as open Vs. This is the same
+       MORPH_GRADIENT ring `strat_silhouette` uses, with two corrections the
+       probe forced. It is computed on the FLATTENED image, because on raw
+       thread texture the silhouette fragments and the ring came back as
+       stipple over the whole design. And its radius scales with the image
+       instead of being a fixed 5x5: on the 199px KESTRELS patch a fixed 5x5
+       is proportionally enormous, `clean_mask`'s protected close then filled
+       every white channel it created, ink went 51.5% -> 68.1% and the bird
+       disappeared. That is the FIFTH instance of this project's oldest
+       pattern -- a cleanup step destroying the fine detail that matters.
+
+    3. TWO ABSTAINS, returning an empty mask so the pipeline's own degenerate
+       guard drops the candidate rather than putting junk on the sheet.
+       Keyline art is a real category and this is honest about not being in it.
+       Verified on the corpus: `NSWU-2` (black field by design) abstains on the
+       first, `anchors` (three gold anchors, no black anywhere -- the image
+       Tyler rejected with "detail lost on all options") abstains on the
+       second.
+
+    `l_black` is a perceptual constant, not a fitted knob: sRGB ~48/255, the
+    boundary where paint stops reading as "a dark colour" and starts reading as
+    "black". A sweep of 15/20/25/30/35/40 over the three failures showed 20 is
+    not sitting on a cliff.
+    """
+    empty = np.zeros(rgb.shape[:2], dtype=bool)
+
+    flat = cv2.bilateralFilter(cv2.bilateralFilter(rgb, 9, 75, 75), 9, 75, 75)
+    dark = _lightness(flat) < l_black
+    sil = _silhouette_of(flat, alpha, lab_tol)
+
+    # Abstain 1: the stock itself is dark. "Is this paint black" is not a
+    # question about ink when the background is black -- every dark-field brand
+    # asset (NSWU-2, VX-30, the SWAT patch, the Saints fleur-de-lis) would come
+    # back as a solid burn. `otsu` is right on those and this must not compete.
+    if (~sil).any() and float(np.median(_lightness(flat)[~sil])) < 40.0:
+        return empty
+
+    # Abstain 2: there is no black drawing in here. Flat colour art with no
+    # outlines yields a few percent of speckle, which traces into junk and
+    # still clears the pipeline's 0.1% degenerate floor.
+    art = int(sil.sum())
+    if not art or (dark & sil).sum() / art < 0.02:
+        return empty
+
+    if not ring:
+        return dark
+
+    r = max(1, round(0.0015 * max(rgb.shape[:2])))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    return dark | (cv2.morphologyEx(sil.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0)
+
+
+def _thicken_thin(ink, floor_px, keep_frac=0.5):
+    """Grow only the features already below the stroke floor.
+
+    Tyler on the embroidered patch, having picked `keyline` for it: *"lines
+    need to be thickened up, but shippable"*. This is the project's third named
+    failure pattern, first recorded 2026-09-02 on `eod tech` -- *"all the lines
+    are half missing. increase stroke"* -- and the log's own prescription is a
+    minimum-stroke floor "enforced by dilating sub-floor features rather than
+    by tracing harder."
+
+    A blanket dilation is the wrong instrument and this project has already
+    paid for finding that out twice: it grows what is ALREADY thick enough and
+    closes the white channels between neighbours, which is how a fixed 5x5 ring
+    erased the KESTRELS bird. So distance-transform the ink, take only the
+    pixels whose stroke half-width is under the floor, and dilate those.
+    """
+    if floor_px < 1:
+        return ink
+    thin = ink & (distance_transform_edt(ink) < floor_px)
+    if not thin.any():
+        return ink
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * floor_px + 1,) * 2)
+    add = (cv2.dilate(thin.astype(np.uint8), k) > 0) & ~ink
+
+    # THE GROWTH IS GAP-PROTECTED, and it was not in the first cut.
+    # Tyler rejected `keyfill` on the embroidered patch: *"the lines arent as
+    # clean and the anchor lost all detail."* Measured and confirmed by eye --
+    # the rope beading along the anchor's shank is a row of separate white
+    # ovals, and growing every sub-floor stroke closed the channels between
+    # them into one blob. THE GAPS BETWEEN AN ANCHOR'S SHADING LINES ARE THE
+    # DETAIL; a growth step that eats them has traded the thing being asked for
+    # against the thing being paid for.
+    #
+    # Seventh instance of this project's oldest failure, and the same shape as
+    # `clean_mask`'s protected close: growth is allowed, but no white region may
+    # lose more than `keep_frac` of itself to it. A hairline seam is consumed
+    # entirely and nobody misses it; a bead, a counter or a shading channel is
+    # not.
+    lab_w = label(~ink, connectivity=1)
+    if lab_w.max():
+        sizes = np.bincount(lab_w.ravel(), minlength=lab_w.max() + 1)
+        eaten = np.bincount(lab_w[add], minlength=lab_w.max() + 1)
+        frac = eaten / np.maximum(sizes, 1)
+        forbid = np.where(frac > keep_frac)[0]
+        forbid = forbid[forbid != 0]
+        if forbid.size:
+            add &= ~np.isin(lab_w, forbid)
+    return ink | add
+
+
+def _grow_counters(mask, min_px):
+    """Grow NESTED ink islands -- letter counters -- to a minimum visible size.
+
+    The counter-side twin of the stroke floor, and it exists because of one
+    measurement. Tyler on the KESTRELS patch: *"silhouette is right there. i
+    mean right there. its missing the dot in the A in VFA."* Zooming the source
+    to individual pixels, **that counter is ONE PIXEL** -- the source is
+    199x254 and the whole letter is about 15px tall.
+
+    So this is not a resolution problem and no upscaler invents it. The
+    information is there; it is one pixel wide, and it dies twice on the way to
+    the plate: Lanczos blurs it, and then `mask_to_paths`'s INTER_CUBIC
+    supersample erases an island of 3x3 or smaller before contouring. Measured
+    at a 2048px working size, the counter survives thresholding as a 7px island
+    and contributes **zero** pixels to the final raster.
+
+    The honest fix is the same one the stroke floor makes: a feature below the
+    minimum visible size cannot reach the plate, so grow it to that size or
+    accept it is lost. Nesting is what makes this safe -- only islands that sit
+    inside an enclosed non-ink region are grown, which is a counter by
+    construction and never a speck in the open background. Same test
+    `clean_mask` already uses to protect counters from `min_area_frac`.
+    """
+    if min_px < 1:
+        return mask
+    lab = label(mask, connectivity=2)
+    if lab.max() == 0:
+        return mask
+    sizes = np.bincount(lab.ravel(), minlength=lab.max() + 1)
+    sizes[0] = 0
+    holes = label(~mask, connectivity=1)
+    border = set(int(b) for b in np.unique(np.concatenate(
+        [holes[0], holes[-1], holes[:, 0], holes[:, -1]])))
+    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    out = mask.copy()
+    for i in range(1, lab.max() + 1):
+        if sizes[i] == 0 or sizes[i] >= min_px * min_px:
+            continue
+        comp = (lab == i).astype(np.uint8)
+        ring = (cv2.dilate(comp, k3) > 0) & ~comp.astype(bool)
+        around = set(int(a) for a in np.unique(holes[ring]) if a != 0)
+        if not around or (around & border):
+            continue                              # not nested: a speck, leave it
+        r = max(1, int(np.ceil((min_px - np.sqrt(sizes[i])) / 2)))
+        kk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1,) * 2)
+        out |= cv2.dilate(comp, kk) > 0
+    return out
+
+
+def _flip_fields(ink, min_field_frac=0.02, min_knock_frac=0.05, ring_px=2,
+                 core_frac=0.004, min_core_share=0.40):
+    """Turn a filled field inside-out: field goes bare, its outline stays as a
+    stroke, and whatever was knocked out of it becomes the ink.
+
+    Tyler's verdict rejecting `keyline` on the KESTRELS patch, verbatim, and it
+    is the whole specification: *"lost the shield outline. words look rough.
+    background should be white. bird black."* `keyline` burns the navy disc
+    solid because the disc IS black paint, so the white bird comes back as a
+    knockout out of a mostly-black plate. He wants the opposite reading and he
+    is right: the disc is a FIELD, the bird is the SUBJECT.
+
+    THE GUARD IS INVERTED RELATIVE TO `composite`, AND THAT IS THE FINDING.
+    `composite` may only remove ink when the knockout is a MINORITY of its
+    host, because wanting to remove most of a field means re-classifying the
+    field rather than reading a detail inside it. Carrying that rule over here
+    was the first attempt and it silently did nothing: measured on this image,
+    the disc is 21.3% of the canvas and its knockouts are 31.7% -- a ratio of
+    1.49, so the minority cap skipped exactly the flip that was wanted.
+    For a FLIP the same evidence points the other way. Knockouts that dominate
+    a field are the strongest possible signal that the field is ground and the
+    knockouts are the subject. So the test is a MINIMUM, not a maximum: flip
+    when there is a real knockout set, and leave a near-solid shape alone
+    because a solid shape is the subject already.
+
+    One operation, and it answers all four of his complaints at once, which is
+    why it is not four fixes: the field's outline is preserved by construction,
+    the bird comes out black, the ground comes out white, and the banner
+    lettering flips from white-on-black to black-on-white.
+    """
+    n, lbl = cv2.connectedComponents(ink.astype(np.uint8), connectivity=8)
+    total = float(ink.size)
+    out = ink.copy()
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring_px + 1,) * 2)
+
+    # A FIELD is thick. A line drawing is not, however much canvas it covers.
+    # Without this the two USN emblems flipped -- their ink is one big
+    # connected network of ~4px strokes spanning most of the frame, so it
+    # passed an area test and came back as a black mass (`keyflip` scored 8.0
+    # against `keyfill`'s 38.3 on the embroidered patch). Area cannot tell a
+    # sprawling stroke network from a filled disc; the distance transform can.
+    #
+    # Measured core share -- the fraction of a blob further than `core_r` from
+    # its own edge -- separates the two cleanly:
+    #     KESTRELS disc 73.3%, its two banners 59.2% and 50.3%   (fields)
+    #     USN vector's stroke network                    25.5%   (not a field)
+    # 0.40 sits in that 24.8-point gap and states the rule in words: a field is
+    # more than half solid, a stroke network is not. n=3 blobs against 1, so
+    # this is a separation worth having and not yet a calibrated constant.
+    core_r = max(2, round(core_frac * max(ink.shape)))
+    core = distance_transform_edt(ink) > core_r
+
+    for c in range(1, n):
+        blob = lbl == c
+        area = int(blob.sum())
+        if area < min_field_frac * total:
+            continue                              # a stroke, not a field
+        if (blob & core).sum() < min_core_share * area:
+            continue                              # strokes, however sprawling
+        foot = binary_fill_holes(blob)
+        holes = foot & ~blob
+        if holes.sum() < min_knock_frac * area:
+            continue                              # solid shape: it IS the subject
+        out[foot] = ~ink[foot]                    # local figure/ground swap
+        out[cv2.morphologyEx(foot.astype(np.uint8), cv2.MORPH_GRADIENT, k) > 0] = True
+    return out
+
+
+def _floor_px(rgb, frac=0.0022):
+    return max(1, round(frac * max(rgb.shape[:2])))
+
+
+def strat_keyfill(rgb, alpha=None, floor_frac=0.0022, **kw):
+    """`keyline` with a minimum-stroke floor. What Tyler asked for on the
+    embroidered patch after picking `keyline` for it.
+
+    Deliberately a SEPARATE strategy rather than a change to `strat_keyline`.
+    Two of his 2026-09-07 picks point at `keyline` SVGs, and `picks.jsonl` is
+    only ground truth for as long as a re-run reproduces the geometry that was
+    judged. Same reasoning that made `composite` a new strategy instead of an
+    edit to `neural`.
+    """
+    ink = strat_keyline(rgb, alpha, **kw)
+    if not ink.any():
+        return ink                                 # keyline abstained
+    return _thicken_thin(ink, _floor_px(rgb, floor_frac))
+
+
+def strat_keyflip(rgb, alpha=None, floor_frac=0.0022, **kw):
+    """`keyline`, with any filled FIELD turned inside-out, then the stroke floor.
+
+    See `_flip_fields` for the mechanism and for Tyler's verbatim spec. This
+    exists as its own tile because the two readings of the same patch are a
+    genuine design choice and not a correctness question -- ink-on-white versus
+    knockout-from-black is his call about how the plate should look, and the
+    slate is how this project has always answered that kind of question.
+
+    ABSTAINS when the flip changed nothing, so it never puts a duplicate of
+    `keyfill` on the sheet. On art with no large filled field -- the two USN
+    emblems, which are pure line drawings -- there is nothing to turn inside
+    out and this correctly declines to occupy a tile.
+    """
+    ink = strat_keyline(rgb, alpha, **kw)
+    if not ink.any():
+        return ink                                 # keyline abstained
+    flipped = _flip_fields(ink, ring_px=max(1, round(0.0015 * max(rgb.shape[:2]))))
+    if np.array_equal(flipped, ink):
+        return np.zeros(rgb.shape[:2], dtype=bool)  # nothing to flip; not a candidate
+    return _thicken_thin(flipped, _floor_px(rgb, floor_frac))
 
 
 def strat_linework(rgb, alpha=None, k=6):
@@ -684,6 +1099,57 @@ def _annotator_slot():
             pass
 
 
+_BATCH_LOCK_FH = None          # module-global: holds the lock for the
+                               # life of the process. The OS releases it
+                               # on exit, including a crash or Ctrl-C.
+
+
+def _acquire_batch_lock(verbose=True):
+    """Only ONE tracing batch may run at a time, machine-wide.
+
+    The annotator has been serialised since 09-06, but the WORKERS never were:
+    each invocation sized its own pool from free memory at the instant it
+    started, so two batches launched seconds apart both measured a quiet machine
+    and both committed. Measured failure, 09-08: `-j 6` (5.4 GB of workers) plus
+    a second run's worker plus one annotator came to ~9.7 GB on a 14 GB laptop
+    with an editor and a browser already resident, and the OOM killer took the
+    editor.
+
+    Per-process resource awareness cannot fix that -- the processes cannot see
+    each other. A lock file can, and it is the same fcntl/msvcrt pattern
+    `_annotator_slot` already proved across separate invocations.
+    """
+    LINEART_CACHE.mkdir(parents=True, exist_ok=True)
+    try:
+        fh = open(LINEART_CACHE / '.batch.lock', 'w')
+        try:
+            import fcntl
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                if verbose:
+                    print('-- another T-Tracer batch is running; waiting for it '
+                          'to finish (this is what stops the two of them from '
+                          'OOM-killing each other)')
+                fcntl.flock(fh, fcntl.LOCK_EX)
+        except ImportError:                          # Windows
+            import msvcrt
+            waited = False
+            while True:
+                try:
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1); break
+                except OSError:
+                    if verbose and not waited:
+                        print('-- another T-Tracer batch is running; waiting')
+                        waited = True
+                    time.sleep(0.5)
+    except Exception:
+        return None                     # never let locking break a real run
+    global _BATCH_LOCK_FH
+    _BATCH_LOCK_FH = fh
+    return fh
+
+
 def _lineart_activation(rgb, res):
     """Line-strength map for `rgb`, cached by content hash across runs.
 
@@ -1010,6 +1476,9 @@ STRATEGIES = {
     'silhouette': strat_silhouette,
     'nested':     strat_nested,
     'composite':  strat_composite,
+    'keyline':    strat_keyline,
+    'keyfill':    strat_keyfill,
+    'keyflip':    strat_keyflip,
 }
 
 # `plate` demoted 2026-09-05 at the reviewer's call. It was the most elaborate
@@ -1039,7 +1508,8 @@ ALL_STRATEGIES = {**STRATEGIES, **OPTIONAL}
 # Making `nested` genuinely alpha-aware is a real option, not a bug fix: alpha
 # identifies the background region exactly, where the BFS currently infers it
 # from whichever region owns the most border pixels.
-ALPHA_AWARE = {'silhouette', 'linework', 'plate', 'inotsu', 'triotsu'}
+ALPHA_AWARE = {'silhouette', 'linework', 'plate', 'inotsu', 'triotsu', 'keyline',
+               'keyfill', 'keyflip'}
 
 
 # ---------------------------------------------------------------------------
@@ -1327,11 +1797,7 @@ def count_nodes(paths):
 def run_one(img_path, out_root, args):
     import hygiene
 
-    from PIL import Image
-    raw = Image.open(img_path)
-    alpha = np.array(raw.convert('RGBA'))[:, :, 3] if 'A' in raw.getbands() else None
-
-    rgb = np.array(flatten_to_white(img_path))
+    rgb, alpha = load_source(img_path, getattr(args, 'work_dim', 0))
     # Order-catalogue art runs to 134 MP. With --scale supersampling on top that
     # is billions of pixels and the run never returns. Engraved artwork is ~32mm
     # tall, so detail past a couple of thousand pixels cannot reach the plate.
@@ -1344,6 +1810,30 @@ def run_one(img_path, out_root, args):
         if alpha is not None:
             alpha = cv2.resize(alpha, (rgb.shape[1], rgb.shape[0]),
                                interpolation=cv2.INTER_AREA)
+    # Small sources: trace BIGGER than they arrived, not smaller.
+    #
+    # `IMG_2379` is 199x254 and Tyler rejected it with "words look rough".
+    # That is not a classification failure -- at 199px a letter stroke is about
+    # 6px and the threshold quantises its curve into a staircase before the
+    # tracer ever sees it. The anti-aliased edges in the source carry sub-pixel
+    # information about where that curve actually runs, and thresholding at
+    # native size throws it away. Upsampling first recovers it: measured on
+    # that image, `KESTRELS` and `VFA-137` go from ragged to clean.
+    #
+    # DEFAULT 0 (OFF), and that is deliberate rather than timid. 11 of the 82
+    # images with a recorded pick are under 800px, so turning this on by
+    # default would change the geometry that 11 rows of `picks.jsonl` point at,
+    # and a pick that cannot be reproduced stops being ground truth. Same
+    # standard the 2026-09-06 determinism work was held to. Turning it on is
+    # Tyler's call, not a side effect.
+    if getattr(args, 'min_dim', 0) and max(rgb.shape[:2]) < args.min_dim:
+        _s = args.min_dim / max(rgb.shape[:2])
+        rgb = cv2.resize(rgb, (max(1, int(rgb.shape[1] * _s)), max(1, int(rgb.shape[0] * _s))),
+                         interpolation=cv2.INTER_LANCZOS4)
+        if alpha is not None:
+            alpha = cv2.resize(alpha, (rgb.shape[1], rgb.shape[0]),
+                               interpolation=cv2.INTER_LANCZOS4)
+
     h, w, _ = rgb.shape
     src_gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
@@ -1386,6 +1876,8 @@ def run_one(img_path, out_root, args):
         if args.invert:
             mask = ~mask
         mask = clean_mask(mask, src_gray, args.close, args.open, args.min_area_frac)
+        if getattr(args, 'min_island', 0):
+            mask = _grow_counters(mask, args.min_island)
 
         ink_frac = float(mask.mean())
         if ink_frac < 0.001 or ink_frac > 0.98:
@@ -1579,9 +2071,29 @@ def main():
     ap.add_argument('--bg', action='store_true', help='include a white background rect')
     ap.add_argument('--in', dest='input_dir', default=None,
                     help='read images from this directory instead of the drop folder')
+    ap.add_argument('--min-island', type=int, default=0,
+                    help='grow nested ink islands (letter counters) to at least '
+                         'this many px across (0 = off). A counter smaller than '
+                         'the eye can resolve is lost on the plate whatever the '
+                         'tracer does. OFF by default: it changes geometry.')
+    ap.add_argument('--min-dim', type=int, default=0,
+                    help='upscale sources whose long edge is under this before '
+                         'tracing (0 = off). Small art quantises its letterforms '
+                         'into a staircase at native size; 800 is a good value. '
+                         'OFF by default because it changes the geometry that '
+                         '11 recorded picks point at.')
     ap.add_argument('--max-dim', type=int, default=2048,
                     help='downscale sources longer than this on the long edge '
                          '(0 = off). Guards against 100+ MP catalogue art.')
+    ap.add_argument('--force-jobs', action='store_true',
+                    help='allow -j above the memory-safe worker count. The '
+                         'safe count exists because exceeding it OOM-kills '
+                         'whatever else is running on the machine.')
+    ap.add_argument('--work-dim', type=int, default=0,
+                    help='resize EVERY source to this long edge as the very '
+                         'first step, so every stage downstream runs at one '
+                         'agreed size (0 = off, keep native). This is the '
+                         'resize that should replace the per-stage ones.')
     ap.add_argument('--out', default='candidates', help='output folder name')
     args = ap.parse_args()
 
@@ -1646,7 +2158,7 @@ def main():
                         if args.src_dir else []:
                     src = cand
                     break
-            rgb = (np.array(flatten_to_white(src)) if src
+            rgb = (load_source(src)[0] if src
                    else np.full(previews[0][1].shape + (3,), 255, np.uint8))
             sheets = out_root / '_sheets'
             sheets.mkdir(parents=True, exist_ok=True)
@@ -1688,6 +2200,10 @@ def main():
         print(f'No images found next to {folder} or in "converter script testers/".')
         return
 
+    # Machine-wide: one batch at a time. Acquired BEFORE the pool is sized,
+    # so the memory reading that sizes it is taken with no other batch live.
+    _acquire_batch_lock()
+
     if args.jobs == 0:
         jobs = auto_jobs(len(images))
     else:
@@ -1695,10 +2211,20 @@ def main():
         if jobs > 1:
             safe = auto_jobs(len(images), verbose=False)
             if jobs > safe:
-                print(f'-- WARNING: -j {jobs} exceeds what this machine can '
-                      f'safely afford right now ({safe}). Each worker holds '
-                      f'~{WORKER_MB} MB and the annotator peaks at '
-                      f'~{ANNOTATOR_MB} MB. Continuing as asked.')
+                # CLAMPED, not warned. It used to print this and continue, and
+                # on 09-08 it was overridden to -j 6 on a machine that could
+                # afford 1 -- which is how the OOM killer got the user's editor.
+                # An advisory that the tool ignores is not a safety feature.
+                # --force-jobs is the deliberate escape hatch.
+                if getattr(args, 'force_jobs', False):
+                    print(f'-- WARNING: -j {jobs} exceeds the safe count '
+                          f'({safe}); --force-jobs given, continuing as asked.')
+                else:
+                    print(f'-- -j {jobs} exceeds what this machine can safely '
+                          f'afford right now ({safe}); using {safe}. Each worker '
+                          f'holds ~{WORKER_MB} MB and the annotator peaks at '
+                          f'~{ANNOTATOR_MB} MB. Pass --force-jobs to override.')
+                    jobs = safe
     if jobs > 1:
         # Images share no state, so this is the axis that actually parallelises.
         # It does NOT speed up a single image -- that would need the strategy
