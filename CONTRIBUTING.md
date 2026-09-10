@@ -32,7 +32,7 @@ the app starts fast and a broken torch cannot take plain tracing down with it.
 ## Arm the hooks first
 
 ```bash
-sh _shared/install-hooks.sh
+sh .githooks/install-hooks.sh
 ```
 
 Once per clone. It points `core.hooksPath` at the tracked `.githooks/`

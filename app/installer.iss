@@ -60,7 +60,7 @@ Source: "..\requirements.txt"; DestDir: "{app}";         Flags: ignoreversion
 ; release workflow overwrites this file with the tag before invoking ISCC, so
 ; this and {#AppVersion} below can never drift apart the way they used to.
 Source: "..\VERSION";          DestDir: "{app}";         Flags: ignoreversion
-Source: "..\_shared\laser-output-rules.md"; DestDir: "{app}\_shared"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "..\_engine\laser-output-rules.md"; DestDir: "{app}\_engine"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Run]
 ; The long pole. Shown in a window rather than hidden, because it downloads

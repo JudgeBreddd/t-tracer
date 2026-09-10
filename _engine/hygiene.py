@@ -219,7 +219,7 @@ def measure_jaggedness(ink, window=9):
 def measure_self_intersections(paths, sample=160):
     """Subpaths that cross themselves. These are what produce overlapping
     geometry, which is the single biggest cause of laser stutter and
-    double-passes (see _shared/laser-output-rules.md).
+    double-passes (see _engine/laser-output-rules.md).
 
     Checked on a decimated polyline - a fitted curve that crosses itself does
     so grossly, not by a sub-pixel sliver, so coarse sampling finds it.

@@ -30,7 +30,7 @@
 # Deliberately NOT a CI check: CI runs after the push, and on a public repo the
 # data is exposed the moment it lands.
 #
-# Installed via core.hooksPath (see _shared/install-hooks.sh) rather than
+# Installed via core.hooksPath (see .githooks/install-hooks.sh) rather than
 # .git/hooks/, so it is tracked, survives a fresh clone, and exists on the
 # Windows desktop too.
 #
@@ -68,8 +68,7 @@ is_allowed() {
     .github/workflows) case "$_base" in *.yml|*.yaml) return 0 ;; esac ;;
     .githooks)         return 0 ;;
     _github-images)    case "$_base" in *.png) return 0 ;; esac ;;
-    _engine)           case "$_base" in *.py) return 0 ;; esac ;;
-    _shared)           case "$_base" in laser-output-rules.md|install-hooks.sh) return 0 ;; esac ;;
+    _engine)           case "$_base" in *.py|laser-output-rules.md) return 0 ;; esac ;;
     app)
         case "$_base" in
         *.py|*.sh|*.ps1|*.iss|*.txt|.gitignore) return 0 ;;

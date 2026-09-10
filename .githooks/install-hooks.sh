@@ -1,7 +1,7 @@
 #!/bin/sh
 # Point git at the tracked hooks in .githooks/ instead of .git/hooks/.
 #
-# Run once per clone:   sh _shared/install-hooks.sh
+# Run once per clone:   sh .githooks/install-hooks.sh
 #
 # core.hooksPath is LOCAL config and cannot be committed, which is the one
 # thing about hooks that always bites. Keeping the hooks themselves in a
@@ -27,6 +27,9 @@ echo
 echo "Active:"
 for h in .githooks/*; do
     [ -f "$h" ] || continue
+    # Skip this installer. It lives alongside the hooks but is not one - git
+    # only ever invokes files named after a real hook event.
+    [ "$(basename "$h")" = "install-hooks.sh" ] && continue
     echo "  $(basename "$h")"
 done
 echo

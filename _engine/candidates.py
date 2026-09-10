@@ -1741,7 +1741,7 @@ def mask_to_paths(mask, scale=6, smooth=3.0, tol=0.6, min_points=16):
 def paths_to_svg(paths, w, h, ink='#000000', background=None, height_mm=None):
     """Emit one <path> holding every subpath, fill-rule evenodd so interior
     holes knock out correctly. Exactly one fill color - the geometry IS the
-    job, per _shared/laser-output-rules.md.
+    job, per _engine/laser-output-rules.md.
 
     A background <rect> is omitted by default: in XCS a white rectangle is
     another closed shape to reason about, not 'nothing'.
