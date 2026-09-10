@@ -89,8 +89,8 @@ worker count is sized by free memory rather than core count.
 The app is a front end. Everything is available directly:
 
 ```bash
-.venv/bin/python _scripts/candidates.py --in ./logos --out ./out
-.venv/bin/python _scripts/pick.py --dir ./out
+.venv/bin/python _engine/candidates.py --in ./logos --out ./out
+.venv/bin/python _engine/pick.py --dir ./out
 ```
 
 `--jobs 0` sizes workers by free memory rather than core count, and caps at

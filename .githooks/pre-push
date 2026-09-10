@@ -53,7 +53,7 @@ fi
 
 # --- the allowlist -----------------------------------------------------------
 # Matched on (directory, filename) so a pattern can never leak into a
-# subdirectory. "_scripts/*.py" must NOT match "_scripts/triage/probe.py",
+# subdirectory. "_engine/*.py" must NOT match "_engine/sub/probe.py",
 # and shell case-globbing would let it, because * matches "/" too.
 is_allowed() {
     _dir=$1
@@ -68,7 +68,7 @@ is_allowed() {
     .github/workflows) case "$_base" in *.yml|*.yaml) return 0 ;; esac ;;
     .githooks)         return 0 ;;
     _github-images)    case "$_base" in *.png) return 0 ;; esac ;;
-    _scripts)          case "$_base" in *.py) return 0 ;; esac ;;
+    _engine)           case "$_base" in *.py) return 0 ;; esac ;;
     _shared)           case "$_base" in laser-output-rules.md|install-hooks.sh) return 0 ;; esac ;;
     app)
         case "$_base" in

@@ -55,7 +55,7 @@ def strat_mine(rgb, alpha=None):
     return mask          # True where the laser should burn
 ```
 
-Register it in `STRATEGIES` in `_scripts/candidates.py`. Add it to `OPTIONAL`
+Register it in `STRATEGIES` in `_engine/candidates.py`. Add it to `OPTIONAL`
 instead if it is experimental — the default sheet is capped at what a person
 can compare at a glance, and strategies get demoted off it when they stop
 winning.
