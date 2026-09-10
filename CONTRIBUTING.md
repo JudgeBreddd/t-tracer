@@ -29,6 +29,22 @@ pipeline; a second one holds PyTorch and the ControlNet lineart annotator,
 which only the `nested` and `composite` strategies need. They are separate so
 the app starts fast and a broken torch cannot take plain tracing down with it.
 
+## Arm the hooks first
+
+```bash
+sh .githooks/install-hooks.sh
+```
+
+Once per clone. It points `core.hooksPath` at the tracked `.githooks/`
+directory, which git cannot do for you — hook config is local by design.
+
+`pre-push` then refuses to publish anything not on its allowlist. This repo is
+public and the calibration corpus it is developed against is real customer
+artwork, so the check is deliberately strict: a path allowlist, an image test
+by magic bytes rather than extension, and a 2 MB size cap. If you add a genuine
+new source file, add its path to the allowlist in `.githooks/pre-push` in the
+same commit.
+
 ## Adding a strategy
 
 A strategy is one function: RGB array in, boolean ink mask out.
@@ -39,7 +55,7 @@ def strat_mine(rgb, alpha=None):
     return mask          # True where the laser should burn
 ```
 
-Register it in `STRATEGIES` in `_scripts/candidates.py`. Add it to `OPTIONAL`
+Register it in `STRATEGIES` in `_engine/candidates.py`. Add it to `OPTIONAL`
 instead if it is experimental — the default sheet is capped at what a person
 can compare at a glance, and strategies get demoted off it when they stop
 winning.
