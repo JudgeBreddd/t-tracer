@@ -108,6 +108,21 @@ APP_PICKS = WORK.parent / 'app-picks.jsonl'
 # ships the scripts but not the corpus), which is expected, not an error.
 CALIB_PICKS = SCRIPTS / 'candidates' / 'picks.jsonl'
 
+# Uploads stream to disk in fixed chunks instead of through one bytes object.
+#
+# `dest.write_bytes(await f.read())` materialised the ENTIRE file in RAM before
+# a single byte reached disk, and several files upload concurrently - so a
+# handful of 130 MP catalogue TIFFs is that many full copies resident at once.
+# On a machine whose tracing workers are already budgeted to the megabyte
+# (see candidates.auto_jobs / WORKER_MB), that is the one unbounded allocation
+# left in the request path. Chunking makes upload memory constant in file size.
+#
+# The cap REJECTS rather than truncates: a half-written PNG still decodes far
+# enough to trace, and it traces into junk that reads as a pipeline bug rather
+# than as a bad upload. Override with TT_MAX_UPLOAD_MB.
+UPLOAD_CHUNK = 1 << 20                       # 1 MiB per read
+MAX_UPLOAD_MB = max(1, int(_os.environ.get('TT_MAX_UPLOAD_MB', '64')))
+
 DEFAULT_SETTINGS = {
     'dest': '',            # last folder saved to - survives a restart
     'share_stats': False,  # opt-IN. Nothing ever leaves this machine unasked.
@@ -251,6 +266,20 @@ def cli_defaults(**over) -> Namespace:
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
 
+# Only ONE tracing batch runs at a time, process-wide.
+#
+# Every submitted job used to start its own daemon thread, and each thread sized
+# its own ProcessPoolExecutor from free memory at the moment it started. Two
+# submissions seconds apart therefore both measured a quiet machine and both
+# committed to a full pool -- individually resource-aware, collectively over
+# budget. Someone dropping 15 images in, watching nothing happen, and dropping
+# them in again is the ordinary way to trigger it, not an edge case.
+#
+# candidates._acquire_batch_lock() covers the same failure ACROSS processes
+# (a CLI run alongside the app). This one covers it within this process, and
+# gives the UI something honest to show while a job waits.
+BATCH = threading.Lock()
+
 
 def _job_file(job_id: str) -> Path:
     return WORK / job_id / 'job.json'
@@ -296,6 +325,21 @@ def _trace_one(img_path: str, out_root: str) -> dict:
 
 def _run_job(job_id: str) -> None:
     job = JOBS[job_id]
+    # Queued is a real, reportable state - not a job that looks hung.
+    if not BATCH.acquire(blocking=False):
+        job['status'] = 'queued'
+        save_job(job)
+        BATCH.acquire()
+    try:
+        job['status'] = 'tracing'
+        save_job(job)
+        _run_job_inner(job_id)
+    finally:
+        BATCH.release()
+
+
+def _run_job_inner(job_id: str) -> None:
+    job = JOBS[job_id]
     src_dir, out_dir = Path(job['src_dir']), Path(job['out_dir'])
     images = sorted(p for p in src_dir.iterdir()
                     if p.suffix.lower() in IMAGE_EXTS)
@@ -333,9 +377,30 @@ def _run_job(job_id: str) -> None:
 app = FastAPI(title='T-Tracer')
 
 
+async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> bool:
+    """Stream one upload to `dest`. False (and no file left behind) if oversized.
+
+    The partial file is removed on ANY exit that is not a clean complete write,
+    including a disconnect mid-upload. A truncated image in the job folder would
+    be picked up by the tracer as though it were a real input.
+    """
+    written = 0
+    try:
+        with dest.open('wb') as out:
+            while chunk := await f.read(UPLOAD_CHUNK):
+                written += len(chunk)
+                if written > max_bytes:
+                    raise ValueError('over limit')
+                out.write(chunk)
+    except BaseException:
+        dest.unlink(missing_ok=True)
+        return False
+    return True
+
+
 @app.post('/api/jobs')
 async def create_job(files: list[UploadFile]):
-    accepted, rejected = [], []
+    accepted, rejected, oversized = [], [], []
     job_id = uuid.uuid4().hex[:12]
     src = WORK / job_id / 'in'
     out = WORK / job_id / 'out'
@@ -355,22 +420,30 @@ async def create_job(files: list[UploadFile]):
             n += 1
             stem = f'{Path(name).stem} ({n})'
         dest = src / f'{stem}{suf}'
-        dest.write_bytes(await f.read())
+        if not await _save_upload(f, dest, MAX_UPLOAD_MB * 1024 * 1024):
+            oversized.append(name)
+            continue
         accepted.append(dest.name)
 
     if not accepted:
         shutil.rmtree(WORK / job_id, ignore_errors=True)
-        raise HTTPException(400, f'No usable images. Rejected: {rejected}')
+        detail = []
+        if oversized:
+            detail.append(f'over the {MAX_UPLOAD_MB} MB limit: '
+                          + ', '.join(oversized))
+        if rejected:
+            detail.append('not an image: ' + ', '.join(rejected))
+        raise HTTPException(400, 'No usable images. ' + '; '.join(detail))
 
     from datetime import datetime
-    JOBS[job_id] = {'id': job_id, 'status': 'tracing', 'done': 0,
+    JOBS[job_id] = {'id': job_id, 'status': 'queued', 'done': 0,
                     'total': len(accepted), 'src_dir': str(src),
                     'out_dir': str(out), 'errors': [], 'rejected': rejected,
                     'created': datetime.now().isoformat(timespec='seconds'),
-                    'names': accepted}
+                    'names': accepted, 'oversized': oversized}
     save_job(JOBS[job_id])
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
-    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected}
+    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected, 'oversized': oversized}
 
 
 @app.get('/api/jobs/{job_id}')

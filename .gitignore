@@ -26,6 +26,11 @@ _scripts/triage/deleted-photos.txt
 _scripts/triage/mask-sweep/
 # Caught by the pre-publish audit, not by planning: 31 more customer logos.
 _scripts/redgold/
+# Caught AFTER a public push, not by the audit: the rejects pile. 47 files,
+# 27.7 MB, including a competitor's watermarked stock insignia. The bare
+# _scripts/*.png rules below match only the top level of _scripts/, so a new
+# SUBFOLDER of images was never covered. Any future one needs its own line.
+_scripts/_not-logos/
 _scripts/*.png
 _scripts/*.jpg
 _scripts/*.jpeg
@@ -38,7 +43,13 @@ stages/06_deliverables/*.svg
 # has no business in a public repo. README.md is the public face instead.
 CLAUDE.md
 CONTEXT.md
-HANDOFF-*.md
+# HANDOFF*.md, not HANDOFF-*.md. The dashed form matched every dated handoff
+# and missed the undashed HANDOFF.md, which reached the public repo on
+# 2026-09-08 as a result.
+HANDOFF*.md
+# Tyler's own working list. Explicitly "a place to mark down my train of
+# thought" - internal by definition, whatever date is on the filename.
+T-Tracer_FIXES*.md
 mvp-run-notes.md
 PLANNING.md
 _archive/
@@ -73,3 +84,22 @@ deferred-work.md
 # Dead code from the archived decompose route (stages 02-05). Referenced by
 # nothing that ships and describes a pipeline this repo no longer contains.
 _shared/scripts/
+
+# ---------------------------------------------------------------------------
+# Customer artwork. NEVER published.
+#
+# _inbox/ is Tyler's drop zone for new customer images - failures to work on,
+# jobs to test. Transient: images move out to _scripts/corpus/ if they become
+# calibration material, or are deleted once the job is done. See _inbox/README.md.
+#
+# The bare /*.png etc. rules are a SAFETY NET, not the intended path. Tyler
+# drops images in the project root by habit (twice on 2026-09-07), and a
+# customer logo reaching the public repo is the one unrecoverable mistake this
+# project can make. Belt and braces on purpose.
+# ---------------------------------------------------------------------------
+_inbox/
+/*.png
+/*.jpg
+/*.jpeg
+/*.webp
+/*.bmp

@@ -105,6 +105,7 @@ async function upload(fileList) {
     const j = await r.json();
     state.jobId = j.job_id;
     if (j.rejected?.length) toast(`Skipped ${j.rejected.length} non-image file(s).`, true);
+    if (j.oversized?.length) toast(`Skipped ${j.oversized.length} file(s) over the upload size limit.`, true);
     poll(j.job_id);
   } catch (err) {
     $('#progress').hidden = true;
@@ -119,9 +120,14 @@ async function poll(jobId) {
   const pct = j.total ? Math.round((j.done / j.total) * 100) : 0;
   $('#barfill').style.width = `${Math.max(pct, 3)}%`;
   $('#progresstext').textContent =
-    j.status === 'ready' ? `Traced ${j.total} image${j.total === 1 ? '' : 's'}`
-                         : `Tracing ${j.done} of ${j.total}…`;
-  if (j.status === 'tracing') return setTimeout(() => poll(jobId), 700);
+    j.status === 'ready'  ? `Traced ${j.total} image${j.total === 1 ? '' : 's'}`
+  : j.status === 'queued' ? `Waiting for the current batch to finish…`
+                          : `Tracing ${j.done} of ${j.total}…`;
+  // 'queued' must keep polling too. Only one batch traces at a time, so a
+  // second submission sits in 'queued' until the first finishes - and a poll
+  // that stopped there would leave it looking hung forever.
+  if (j.status === 'tracing' || j.status === 'queued')
+    return setTimeout(() => poll(jobId), 700);
   if (j.errors?.length) toast(j.errors[0], true);
   setTimeout(() => { $('#progress').hidden = true; }, 900);
   loadResults(jobId);
