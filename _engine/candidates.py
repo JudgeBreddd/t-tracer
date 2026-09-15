@@ -91,6 +91,9 @@ MAX_MEGAPIXELS = max(1.0, float(os.environ.get('TT_MAX_MEGAPIXELS', '200')))
 # Tyler locked 1600 on 2026-09-08 and turned it on by default 2026-09-14: it
 # produced 55/58 shippable. The app and the CLI both read this one value.
 WORK_DIM_DEFAULT = 1600
+# Sources this small keep their native size. Tyler, 2026-09-14: a 385px JPEG
+# enlarged to 1600 traced with rippled edges; at native size it was clean.
+NATIVE_MAX_PX = 400
 
 
 def _align_pillow_limit():
@@ -123,6 +126,7 @@ def load_source(img_path, work_dim=0):
     itself, and JPEG sources avoid even that.
 
     `work_dim` 0 keeps the original size (the default is WORK_DIM_DEFAULT).
+    Sources whose long edge is NATIVE_MAX_PX or less are never resized.
     """
     from PIL import Image
     with Image.open(img_path) as probe:
@@ -146,8 +150,9 @@ def load_source(img_path, work_dim=0):
         rgba = im.convert('RGBA')
 
     # THE RESIZE. Before the composite, before anything.
-    if work_dim and max(rgba.size) != work_dim:
-        sc = work_dim / max(rgba.size)
+    long_edge = max(rgba.size)
+    if work_dim and long_edge > NATIVE_MAX_PX and long_edge != work_dim:
+        sc = work_dim / long_edge
         tgt = (max(1, round(rgba.width * sc)), max(1, round(rgba.height * sc)))
         # BOX on the way down, BICUBIC on the way up. Matches the cv2
         # INTER_AREA / INTER_LANCZOS4 split the pipeline already used, and
@@ -2099,7 +2104,8 @@ def main():
                     help='resize EVERY source to this long edge as the very '
                          'first step, so every stage downstream runs at one '
                          f'agreed size (default {WORK_DIM_DEFAULT}; 0 = off, '
-                         'keep native).')
+                         f'keep native). Sources of {NATIVE_MAX_PX}px or less '
+                         'always keep native size.')
     ap.add_argument('--out', default='candidates', help='output folder name')
     args = ap.parse_args()
 
