@@ -127,6 +127,9 @@ async function upload(fileList) {
     state.jobId = j.job_id;
     if (j.rejected?.length) toast(`Skipped ${j.rejected.length} non-image file(s).`, true);
     if (j.oversized?.length) toast(`Skipped ${j.oversized.length} file(s) over the upload size limit.`, true);
+    // Distinct from "oversized" - a write failure (e.g. the disk is full) is
+    // not a limit the user can fix by picking a smaller file.
+    if (j.failed?.length) toast(`Could not save ${j.failed.length} file(s) - check disk space.`, true);
     poll(j.job_id);
   } catch (err) {
     $('#progress').hidden = true;

@@ -330,7 +330,9 @@ def load_jobs() -> None:
         try:
             job = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError):
-            continue
+            continue                     # corrupt/truncated job.json: skip it
+        if not isinstance(job, dict):
+            continue                     # valid JSON, wrong shape - same idea
         # Rebuild the paths from where the folder actually IS rather than
         # trusting what was written. job.json used to carry absolute paths, so
         # moving the work directory (out of OneDrive, for one) silently
@@ -339,8 +341,12 @@ def load_jobs() -> None:
         job['src_dir'] = str(d / 'in')
         job['out_dir'] = str(d / 'out')
         job['id'] = d.name
-        # A job interrupted by a quit would otherwise sit at "tracing" forever.
-        if job.get('status') == 'tracing':
+        # No thread survives a restart to finish either of these, so both
+        # would otherwise sit in History forever looking like they are still
+        # running - 'tracing' was already fixed; 'queued' (killed while
+        # waiting on the batch lock, before it ever started) is the same
+        # failure and was missed - error-path audit, item 3.55.
+        if job.get('status') in ('tracing', 'queued'):
             job['status'] = 'interrupted'
         JOBS[job['id']] = job
 
@@ -423,12 +429,17 @@ async def _require_session_token(request: Request, call_next):
     return await call_next(request)
 
 
-async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> bool:
-    """Stream one upload to `dest`. False (and no file left behind) if oversized.
+async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> str:
+    """Stream one upload to `dest`. Returns 'ok', 'oversized' or 'error'.
 
     The partial file is removed on ANY exit that is not a clean complete write,
     including a disconnect mid-upload. A truncated image in the job folder would
     be picked up by the tracer as though it were a real input.
+
+    'oversized' and 'error' used to be the same outcome (both just `False`),
+    which meant a disk-full write (error-path audit, item 3.55: simulated with
+    OSError(ENOSPC)) was reported to the user as "over the upload size limit" -
+    true of nothing on their end and actively misleading about what to fix.
     """
     written = 0
     try:
@@ -436,17 +447,18 @@ async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> bool:
             while chunk := await f.read(UPLOAD_CHUNK):
                 written += len(chunk)
                 if written > max_bytes:
-                    raise ValueError('over limit')
+                    dest.unlink(missing_ok=True)
+                    return 'oversized'
                 out.write(chunk)
-    except BaseException:
+    except Exception:                                      # noqa: BLE001
         dest.unlink(missing_ok=True)
-        return False
-    return True
+        return 'error'
+    return 'ok'
 
 
 @app.post('/api/jobs')
 async def create_job(files: list[UploadFile]):
-    accepted, rejected, oversized = [], [], []
+    accepted, rejected, oversized, failed = [], [], [], []
     job_id = uuid.uuid4().hex[:12]
     src = WORK / job_id / 'in'
     out = WORK / job_id / 'out'
@@ -466,8 +478,12 @@ async def create_job(files: list[UploadFile]):
             n += 1
             stem = f'{Path(name).stem} ({n})'
         dest = src / f'{stem}{suf}'
-        if not await _save_upload(f, dest, MAX_UPLOAD_MB * 1024 * 1024):
+        result = await _save_upload(f, dest, MAX_UPLOAD_MB * 1024 * 1024)
+        if result == 'oversized':
             oversized.append(name)
+            continue
+        if result == 'error':
+            failed.append(name)
             continue
         accepted.append(dest.name)
 
@@ -479,6 +495,12 @@ async def create_job(files: list[UploadFile]):
                           + ', '.join(oversized))
         if rejected:
             detail.append('not an image: ' + ', '.join(rejected))
+        if failed:
+            # Distinct from "oversized" on purpose (error-path audit, item
+            # 3.55): telling someone their file is too big when the real
+            # problem is the destination disk sends them fixing the wrong thing.
+            detail.append('could not be saved (disk full or unwritable): '
+                          + ', '.join(failed))
         raise HTTPException(400, 'No usable images. ' + '; '.join(detail))
 
     from datetime import datetime
@@ -486,10 +508,11 @@ async def create_job(files: list[UploadFile]):
                     'total': len(accepted), 'src_dir': str(src),
                     'out_dir': str(out), 'errors': [], 'rejected': rejected,
                     'created': datetime.now().isoformat(timespec='seconds'),
-                    'names': accepted, 'oversized': oversized}
+                    'names': accepted, 'oversized': oversized, 'failed': failed}
     save_job(JOBS[job_id])
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
-    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected, 'oversized': oversized}
+    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected,
+            'oversized': oversized, 'failed': failed}
 
 
 @app.get('/api/jobs/{job_id}')
@@ -497,8 +520,13 @@ def job_status(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, 'unknown job')
-    return {k: job[k] for k in
-            ('id', 'status', 'done', 'total', 'errors', 'rejected')}
+    # .get() with defaults, not job[k]: a job.json truncated by a kill mid-save
+    # (or mid-write to disk-full) can be valid JSON missing some of these keys
+    # entirely, and a plain KeyError here used to turn that into a 500 on
+    # every poll of that job - error-path audit, item 3.55.
+    return {'id': job.get('id', job_id), 'status': job.get('status', 'unknown'),
+            'done': job.get('done', 0), 'total': job.get('total', 0),
+            'errors': job.get('errors', []), 'rejected': job.get('rejected', [])}
 
 
 @app.get('/api/jobs/{job_id}/results')
@@ -519,7 +547,16 @@ def job_results(job_id: str):
         mp = d / 'metrics.json'
         if not mp.exists():
             continue
-        metrics = json.loads(mp.read_text())
+        # A trace killed mid-write (process killed, or disk full) can leave
+        # metrics.json truncated - valid on disk, not valid JSON. That used to
+        # be an unhandled JSONDecodeError, turning ONE bad image into a 500 for
+        # the whole job's results, including every OTHER image that traced
+        # fine. Skip just this image instead, same as the missing-file case
+        # right above it - error-path audit, item 3.55.
+        try:
+            metrics = json.loads(mp.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
         cands = []
         for i, (name, sc) in enumerate(C.rank_candidates(metrics), 1):
             if not (d / f'{name}.png').exists():
