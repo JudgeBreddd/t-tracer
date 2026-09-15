@@ -520,7 +520,7 @@ const cssEsc = (s) => (window.CSS?.escape ? CSS.escape(s) : String(s).replace(/[
  * the one i download doesnt work, i can grab the another one from a previous
  * run." */
 const TABS = { current: $('#tab-current'), history: $('#tab-history'),
-               stats: $('#tab-stats') };
+               stats: $('#tab-stats'), settings: $('#tab-settings') };
 
 function showTab(which) {
   Object.entries(TABS).forEach(([name, el]) => {
@@ -530,12 +530,14 @@ function showTab(which) {
   const cur = which === 'current';
   $('#history').hidden = which !== 'history';
   $('#stats').hidden = which !== 'stats';
+  $('#settings').hidden = which !== 'settings';
   $('#drop').hidden = !cur;
   $('#howto').hidden = !cur;
   $('#results').hidden = !cur || !state.images.length;
   $('#actionbar').hidden = !cur || !state.images.length;
   if (which === 'history') loadHistory();
   if (which === 'stats') loadStats();
+  if (which === 'settings') loadSettingsTab();
 }
 Object.keys(TABS).forEach((name) =>
   TABS[name].addEventListener('click', () => showTab(name)));
@@ -870,6 +872,104 @@ function shareGroup(d) {
 
   actions.append(build, copy, issue);
   wrap.append(label, actions, box);
+  g.appendChild(wrap);
+  return g;
+}
+
+
+/* ---------------- settings tab (item 7: history storage controls) ----------------
+ * "Settings shows storage used; Clear generated history button; retention
+ * option (Forever / 90 days / 30 days, default Forever)." Cleanup itself
+ * lives entirely server-side (select_jobs_to_clean in server.py) - this is
+ * just the display and the two controls that trigger it. */
+function humanBytes(n) {
+  if (n == null) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+async function loadSettingsTab() {
+  const box = $('#settings');
+  box.innerHTML = '<p class="hempty">Loading…</p>';
+  let storageInfo;
+  try {
+    storageInfo = await (await apiFetch('/api/storage')).json();
+  } catch (_) {
+    box.innerHTML = '<p class="hempty">Could not load settings.</p>';
+    return;
+  }
+  box.innerHTML = '';
+  box.appendChild(storageGroup(storageInfo));
+}
+
+function storageGroup(info) {
+  const g = document.createElement('section');
+  g.className = 'statgroup';
+  g.innerHTML = `<h2>History storage</h2>
+    <p class="sub">Every traced job's source images, previews and candidate
+      SVGs, kept so History can reopen them. Settings, your judged picks and
+      the calibration statistics are never touched by anything on this page.</p>`;
+
+  const nums = document.createElement('div');
+  nums.className = 'bignums';
+  nums.append(
+    bignum(humanBytes(info.bytes), 'used', `${info.jobs} job${info.jobs === 1 ? '' : 's'} in history`),
+  );
+  g.appendChild(nums);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'share';
+
+  const retLabel = document.createElement('p');
+  retLabel.className = 'sub';
+  retLabel.style.margin = '0 0 4px';
+  retLabel.textContent = 'Keep history:';
+  const retWrap = document.createElement('div');
+  retWrap.style.cssText = 'display:flex; gap:16px; flex-wrap:wrap';
+  const options = [['forever', 'Forever'], ['90d', '90 days'], ['30d', '30 days']];
+  options.forEach(([value, text]) => {
+    const label = document.createElement('label');
+    label.className = 'optin';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'retention';
+    input.value = value;
+    input.checked = (settings.retention || 'forever') === value;
+    input.addEventListener('change', () => { if (input.checked) saveSettings({ retention: value }); });
+    const span = document.createElement('span');
+    span.textContent = text;
+    label.append(input, span);
+    retWrap.appendChild(label);
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'share-actions';
+  const clearBtn = document.createElement('button');
+  clearBtn.className = 'ghost';
+  clearBtn.type = 'button';
+  clearBtn.textContent = 'Clear generated history';
+  clearBtn.title = 'Deletes finished jobs\' files. Active/queued jobs, settings, '
+    + 'and your judged picks are never touched.';
+  clearBtn.addEventListener('click', async () => {
+    clearBtn.disabled = true;
+    try {
+      const r = await apiFetch('/api/history/clear', { method: 'POST' });
+      const j = await r.json();
+      toast(`Cleared ${j.cleared} job${j.cleared === 1 ? '' : 's'} — freed ${humanBytes(j.bytes_freed)}.`);
+      // Anything cleared may still be open in Current/History - drop it from
+      // both rather than leaving a card pointing at files that no longer exist.
+      loadSettingsTab();
+    } catch (err) {
+      toast(String(err.message || err), true);
+    } finally {
+      clearBtn.disabled = false;
+    }
+  });
+
+  actions.appendChild(clearBtn);
+  wrap.append(retLabel, retWrap, actions);
   g.appendChild(wrap);
   return g;
 }

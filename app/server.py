@@ -150,10 +150,15 @@ CALIB_PICKS = _paths.PICKS
 UPLOAD_CHUNK = 1 << 20                       # 1 MiB per read
 MAX_UPLOAD_MB = max(1, int(_os.environ.get('TT_MAX_UPLOAD_MB', '64')))
 
+RETENTION_DAYS = {'90d': 90, '30d': 30}    # 'forever' has no entry - never expires
+
 DEFAULT_SETTINGS = {
     'dest': '',            # last folder saved to - survives a restart
     'share_stats': False,  # opt-IN. Nothing ever leaves this machine unasked.
     'role': 'user',        # 'owner' marks the reviewer's own install in shared rows
+    'auto_update': False,  # item 3.5. Off by default; Windows-only regardless
+                            # of this value (server enforces it, not just the UI).
+    'retention': 'forever', # item 7: 'forever' | '90d' | '30d'
 }
 
 
@@ -660,6 +665,91 @@ def forget_job(job_id: str):
     return {'ok': True}
 
 
+# --------------------------------------------------------------------------
+# Item 7: history/storage controls.
+#
+# Everything a job writes lives under WORK/<job_id>/ - settings.json and
+# app-picks.jsonl sit one level up, at WORK.parent, and the calibration
+# picks.jsonl (CALIB_PICKS) lives entirely outside WORK, under _private/. A
+# cleanup that only ever does shutil.rmtree(WORK / job_id) therefore CANNOT
+# reach any of those, structurally, not by convention - "cleanup must never
+# destroy settings/picks/field statistics" holds even if this code has a bug
+# in which job_ids it picks.
+# --------------------------------------------------------------------------
+
+# A job in either of these states has a thread (or a restart-recovery path)
+# that still owns its folder. Cleanup must never touch it out from under
+# that - "active/queued jobs are never removed by cleanup".
+ACTIVE_STATUSES = {'queued', 'tracing'}
+
+
+def select_jobs_to_clean(jobs: dict[str, dict], cutoff: str | None = None) -> list[str]:
+    """Which job ids a cleanup pass may delete. Pure - no disk I/O, easy to test.
+
+    `cutoff`: an ISO 'created' timestamp. None means "every finished job,
+    regardless of age" (the manual Clear button); given, only jobs created
+    strictly before it qualify (the automatic retention sweep).
+    """
+    return [job_id for job_id, job in jobs.items()
+            if job.get('status') not in ACTIVE_STATUSES
+            and (cutoff is None or str(job.get('created', '')) < cutoff)]
+
+
+def _dir_size(path: Path) -> int:
+    if not path.is_dir():
+        return 0
+    total = 0
+    for p in path.rglob('*'):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass                      # a file that vanished mid-scan is not fatal
+    return total
+
+
+def _clean_jobs(job_ids: list[str]) -> int:
+    """Delete the given job folders. Returns bytes freed."""
+    freed = 0
+    for job_id in job_ids:
+        freed += _dir_size(WORK / job_id)
+        shutil.rmtree(WORK / job_id, ignore_errors=True)
+        JOBS.pop(job_id, None)
+    return freed
+
+
+def _apply_retention() -> None:
+    """Automatic cleanup by the configured retention window, run once at launch.
+
+    After load_jobs() so JOBS reflects what is actually on disk, and before
+    the server starts accepting requests, so an install nobody opens Settings
+    on still shrinks rather than growing forever at 'forever' by default doing
+    nothing until someone changes it.
+    """
+    days = RETENTION_DAYS.get(load_settings().get('retention', 'forever'))
+    if not days:
+        return                            # 'forever' (or an unknown value): no-op
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec='seconds')
+    _clean_jobs(select_jobs_to_clean(JOBS, cutoff))
+
+
+@app.get('/api/storage')
+def storage():
+    """Disk used by everything History can show - the number the Settings
+    tab's "X used" line reports, and what Clear/retention actually reclaim."""
+    return {'bytes': _dir_size(WORK), 'jobs': len(JOBS)}
+
+
+@app.post('/api/history/clear')
+def clear_history():
+    """The manual 'Clear generated history' button: every FINISHED job, now,
+    regardless of age. Active/queued jobs are skipped - see select_jobs_to_clean."""
+    ids = select_jobs_to_clean(JOBS)
+    freed = _clean_jobs(ids)
+    return {'cleared': len(ids), 'bytes_freed': freed}
+
+
 @app.get('/api/pick-folder')
 def pick_folder():
     """Native folder chooser, server-side.
@@ -723,11 +813,17 @@ class Settings(BaseModel):
     dest: str | None = None
     share_stats: bool | None = None
     role: str | None = None
+    auto_update: bool | None = None
+    retention: str | None = None
 
 
 @app.get('/api/settings')
 def get_settings():
-    return load_settings()
+    # 'platform' is computed, never persisted - it rides along so the
+    # Settings tab can hide/disable the auto-update toggle on anything that
+    # is not Windows without a second round trip. It is dropped again by
+    # write_settings() (only DEFAULT_SETTINGS keys survive a PUT).
+    return {**load_settings(), 'platform': sys.platform}
 
 
 @app.put('/api/settings')
@@ -740,7 +836,10 @@ def put_settings(req: Settings):
     empty against the new one. Storing it next to the work directory makes it
     independent of whichever port the app happened to get.
     """
-    return write_settings(req.model_dump(exclude_none=True))
+    patch = req.model_dump(exclude_none=True)
+    if 'retention' in patch and patch['retention'] not in ('forever', *RETENTION_DAYS):
+        raise HTTPException(400, "retention must be 'forever', '90d' or '30d'")
+    return write_settings(patch)
 
 
 class JudgeRow(BaseModel):
@@ -897,6 +996,7 @@ def serve(host='127.0.0.1', port=8765):
     migrate_legacy_dir()
     WORK.mkdir(parents=True, exist_ok=True)
     load_jobs()
+    _apply_retention()
     # main.py reads SESSION_TOKEN off the module directly and puts it in the
     # window URL, so the normal launch path never needs this. It is printed
     # here only for `python server.py` directly - the "Try: python server.py"
