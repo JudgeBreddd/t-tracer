@@ -7,6 +7,27 @@
  * that away. */
 
 const $ = (s) => document.querySelector(s);
+
+/* ---------------- session token (item 8) ----------------
+ * main.py puts the launch token in the page URL because there is nowhere
+ * else for a freshly loaded static page to learn it from - it is generated
+ * fresh per launch and never persisted. Read once here and attached to every
+ * API call from then on. */
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+function apiFetch(url, opts = {}) {
+  const headers = new Headers(opts.headers || {});
+  if (TOKEN) headers.set('X-T-Tracer-Token', TOKEN);
+  return fetch(url, { ...opts, headers });
+}
+// <img src> can't carry a header, so the two read-only image endpoints
+// (preview and source) take the token as a query param instead. Applied once,
+// where the URLs first arrive from the server (loadResults), so every
+// consumer of img.source / candidate.preview - cards, the viewer - gets a
+// working URL for free without needing to know about tokens at all.
+function withToken(url) {
+  if (!url || !TOKEN) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'tt_token=' + encodeURIComponent(TOKEN);
+}
 // `images` ACCUMULATES across drops. Each entry carries the job it came from,
 // because preview URLs and the save endpoint are both job-scoped. The first
 // version replaced the list on every upload, so adding a second logo silently
@@ -27,7 +48,7 @@ let settings = { dest: '', share_stats: false, role: 'user' };
 
 async function loadSettings() {
   try {
-    settings = await (await fetch('/api/settings')).json();
+    settings = await (await apiFetch('/api/settings')).json();
     $('#dest').value = settings.dest || '';
   } catch (_) { /* defaults are fine */ }
   refreshAction();
@@ -36,7 +57,7 @@ async function loadSettings() {
 async function saveSettings(patch) {
   Object.assign(settings, patch);
   try {
-    await fetch('/api/settings', {
+    await apiFetch('/api/settings', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
@@ -58,7 +79,7 @@ $('#browse').addEventListener('click', async () => {
       if (p) setDest(p);
       return;
     }
-    const r = await fetch('/api/pick-folder');
+    const r = await apiFetch('/api/pick-folder');
     const j = await r.json();
     if (j.path) setDest(j.path);
     else if (j.unavailable) {
@@ -100,7 +121,7 @@ async function upload(fileList) {
   $('#barfill').style.width = '2%';
   $('#progresstext').textContent = 'Uploading…';
   try {
-    const r = await fetch('/api/jobs', { method: 'POST', body: fd });
+    const r = await apiFetch('/api/jobs', { method: 'POST', body: fd });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const j = await r.json();
     state.jobId = j.job_id;
@@ -115,7 +136,7 @@ async function upload(fileList) {
 
 /* ---------------- progress ---------------- */
 async function poll(jobId) {
-  const r = await fetch(`/api/jobs/${jobId}`);
+  const r = await apiFetch(`/api/jobs/${jobId}`);
   const j = await r.json();
   const pct = j.total ? Math.round((j.done / j.total) * 100) : 0;
   $('#barfill').style.width = `${Math.max(pct, 3)}%`;
@@ -135,13 +156,19 @@ async function poll(jobId) {
 
 /* ---------------- results ---------------- */
 async function loadResults(jobId) {
-  const r = await fetch(`/api/jobs/${jobId}/results`);
+  const r = await apiFetch(`/api/jobs/${jobId}/results`);
   const fresh = (await r.json()).images;
   const box = $('#results');
   box.hidden = false;
 
   fresh.forEach((img) => {
     img.jobId = jobId;
+    // Preview/source URLs are loaded via <img src>, which cannot carry the
+    // auth header apiFetch uses - stamp the token on as a query param here,
+    // once, so every consumer downstream (cards, the full-size viewer) just
+    // uses img.source / candidate.preview and gets a working URL for free.
+    img.source = withToken(img.source);
+    img.candidates.forEach((c) => { c.preview = withToken(c.preview); });
     // A repeat of the same filename would collide on `stem` as the key, so it
     // gets a display key that stays unique across drops. The saved SVG keeps
     // the plain name; the server handles that collision separately.
@@ -445,7 +472,7 @@ $('#save').addEventListener('click', async () => {
   const failures = [];
   try {
     for (const [jobId, picks] of Object.entries(byJob)) {
-      const r = await fetch(`/api/jobs/${jobId}/save`, {
+      const r = await apiFetch(`/api/jobs/${jobId}/save`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dest, picks }),
       });
@@ -514,7 +541,7 @@ async function loadHistory() {
   const box = $('#history');
   box.innerHTML = '<p class="hempty">Loading…</p>';
   try {
-    const { jobs } = await (await fetch('/api/history')).json();
+    const { jobs } = await (await apiFetch('/api/history')).json();
     const open = new Set(state.images.map((i) => i.jobId));
     if (!jobs.length) {
       box.innerHTML = '<p class="hempty">Nothing traced yet.</p>';
@@ -543,7 +570,7 @@ async function loadHistory() {
       del.textContent = 'Delete';
       del.title = 'Remove this run and its traced files from disk';
       del.addEventListener('click', async () => {
-        await fetch(`/api/jobs/${j.id}`, { method: 'DELETE' });
+        await apiFetch(`/api/jobs/${j.id}`, { method: 'DELETE' });
         state.images = state.images.filter((i) => i.jobId !== j.id);
         document.querySelectorAll('.card').forEach((c) => {
           if (!state.images.some((i) => i.key === c.dataset.card)) c.remove();
@@ -586,7 +613,7 @@ async function recordJudgement(imgs) {
   imgs.forEach((img) => { (byJob[img.jobId] ||= []).push(judgementFor(img)); });
   for (const [jobId, rows] of Object.entries(byJob)) {
     try {
-      await fetch(`/api/jobs/${jobId}/judge`, {
+      await apiFetch(`/api/jobs/${jobId}/judge`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(rows),
       });
@@ -623,7 +650,7 @@ async function loadStats() {
   box.innerHTML = '<p class="hempty">Loading…</p>';
   let d;
   try {
-    d = await (await fetch('/api/stats')).json();
+    d = await (await apiFetch('/api/stats')).json();
   } catch (_) {
     box.innerHTML = '<p class="hempty">Could not load statistics.</p>';
     return;
@@ -814,7 +841,7 @@ function shareGroup(d) {
 
   build.addEventListener('click', async () => {
     try {
-      const r = await fetch('/api/stats/report');
+      const r = await apiFetch('/api/stats/report');
       const j = await r.json();
       if (!r.ok) { toast(j.detail || 'Could not build the report.', true); return; }
       const text = JSON.stringify(j, null, 2);
@@ -853,7 +880,7 @@ function shareGroup(d) {
 async function checkUpdate() {
   let d;
   try {
-    d = await (await fetch('/api/update-check')).json();
+    d = await (await apiFetch('/api/update-check')).json();
   } catch (_) { return; }
   if (!d.update) return;
   let dismissed = null;

@@ -15,6 +15,7 @@ bound to loopback only.
 from __future__ import annotations
 
 import json
+import secrets
 import shutil
 import sys
 import threading
@@ -23,8 +24,8 @@ from argparse import Namespace
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -85,6 +86,27 @@ APP_VERSION = _read_app_version()
 # report someone else's releases as its own updates.
 import os as _os
 REPO = _os.environ.get('TT_REPO', 'JudgeBreddd/t-tracer')
+
+# Item 8: a random per-launch token, required on every /api/ request.
+#
+# 127.0.0.1-only binding was the entire access control until now. That is fine
+# against another machine on the network, but not against another local-web
+# origin on the SAME machine - a malicious page in a normal browser tab can
+# already reach 127.0.0.1 (that is the whole "localhost is not a security
+# boundary" class of bug), and this API deletes files and runs CPU-heavy jobs.
+#
+# Generated once per process, never written to disk, never logged except at
+# direct `python server.py` startup where there is no other way to learn it.
+# Regenerates every launch by construction - there is nowhere it could be
+# cached between runs.
+SESSION_TOKEN = secrets.token_urlsafe(32)
+TOKEN_HEADER = 'X-T-Tracer-Token'
+# <img src> / <a href> requests (SVG/PNG previews, the source image) cannot
+# set a custom header, so those two endpoints accept the token as a query
+# param instead - everything else must use the header. app.js appends this
+# param when it builds those URLs; it never appends it to a real fetch() call,
+# so the token does not end up in fetch's Referer/logs for anything else.
+TOKEN_QUERY_PARAM = 'tt_token'
 
 # Settings and the app's own pick log live beside the work directory, i.e.
 # under ~/.cache (or LOCALAPPDATA), NEVER inside the project. Same reason the
@@ -381,6 +403,24 @@ def _run_job_inner(job_id: str) -> None:
 
 
 app = FastAPI(title='T-Tracer')
+
+
+@app.middleware('http')
+async def _require_session_token(request: Request, call_next):
+    """Every /api/ request needs the launch token; the static frontend does not.
+
+    The static mount (index.html, app.js, app.css, icons) is intentionally
+    left open: the page itself has to load before it can learn the token, and
+    it carries no capability - reading app.js is not the same risk as being
+    able to call POST /api/jobs or DELETE /api/jobs/{id}.
+    """
+    if request.url.path.startswith('/api/'):
+        token = (request.headers.get(TOKEN_HEADER)
+                 or request.query_params.get(TOKEN_QUERY_PARAM))
+        if token != SESSION_TOKEN:
+            return JSONResponse({'detail': 'missing or invalid session token'},
+                                status_code=401)
+    return await call_next(request)
 
 
 async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> bool:
@@ -820,6 +860,12 @@ def serve(host='127.0.0.1', port=8765):
     migrate_legacy_dir()
     WORK.mkdir(parents=True, exist_ok=True)
     load_jobs()
+    # main.py reads SESSION_TOKEN off the module directly and puts it in the
+    # window URL, so the normal launch path never needs this. It is printed
+    # here only for `python server.py` directly - the "Try: python server.py"
+    # fallback main.py itself suggests - where there is no other way to learn
+    # the token the API now requires.
+    print(f'T-Tracer: session token for direct API use: {SESSION_TOKEN}')
     uvicorn.run(app, host=host, port=port, log_level='warning')
 
 
