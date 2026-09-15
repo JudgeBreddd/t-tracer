@@ -80,16 +80,32 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed' }
           Get-ChildItem dist
 
+      # Item 3.5 (auto-update) needs this published alongside the installer:
+      # the running app hashes its own download against it before ever
+      # executing anything, same idea as app/install.ps1's PyInstallerSha256
+      # check one level down (this installer's own Python download). Same
+      # Get-FileHash call, so both checks trust the same mechanism.
+      - name: Publish the installer's SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Path dist\T-Tracer-Setup.exe -Algorithm SHA256).Hash
+          Set-Content -Path dist\T-Tracer-Setup.exe.sha256 -Value $hash -NoNewline
+          Write-Host "SHA-256: $hash"
+
       - uses: actions/upload-artifact@v4
         with:
           name: T-Tracer-Setup
-          path: dist/T-Tracer-Setup.exe
+          path: |
+            dist/T-Tracer-Setup.exe
+            dist/T-Tracer-Setup.exe.sha256
 
       - name: Attach to the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/T-Tracer-Setup.exe
+          files: |
+            dist/T-Tracer-Setup.exe
+            dist/T-Tracer-Setup.exe.sha256
           body: |
             Download **T-Tracer-Setup.exe** below and run it.
 

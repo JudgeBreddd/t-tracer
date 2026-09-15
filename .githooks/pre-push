@@ -69,6 +69,7 @@ is_allowed() {
     .githooks)         return 0 ;;
     _github-images)    case "$_base" in *.png) return 0 ;; esac ;;
     _engine)           case "$_base" in *.py|laser-output-rules.md) return 0 ;; esac ;;
+    tests)             case "$_base" in *.py) return 0 ;; esac ;;
     app)
         case "$_base" in
         *.py|*.sh|*.ps1|*.iss|*.txt|.gitignore) return 0 ;;

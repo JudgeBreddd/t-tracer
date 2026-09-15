@@ -14,7 +14,10 @@ bound to loopback only.
 """
 from __future__ import annotations
 
+import hmac
 import json
+import re
+import secrets
 import shutil
 import sys
 import threading
@@ -23,7 +26,7 @@ from argparse import Namespace
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -86,6 +89,28 @@ APP_VERSION = _read_app_version()
 import os as _os
 REPO = _os.environ.get('TT_REPO', 'JudgeBreddd/t-tracer')
 
+# Item 8: a random per-launch token, required on every /api/ request.
+#
+# 127.0.0.1-only binding was the entire access control until now. That is fine
+# against another machine on the network, but not against another local-web
+# origin on the SAME machine - a malicious page in a normal browser tab can
+# already reach 127.0.0.1 (that is the whole "localhost is not a security
+# boundary" class of bug), and this API deletes files and runs CPU-heavy jobs.
+#
+# Generated once per process, never written to disk, never logged except at
+# direct `python server.py` startup where there is no other way to learn it.
+# Regenerates every launch by construction - there is nowhere it could be
+# cached between runs.
+SESSION_TOKEN = secrets.token_urlsafe(32)
+TOKEN_HEADER = 'X-T-Tracer-Token'
+# <img src> / <a href> requests (SVG/PNG previews, the source image) cannot
+# set a custom header, so those two endpoints accept the token as a query
+# param instead - everything else must use the header. app.js appends this
+# param when it builds those URLs; it never appends it to a real fetch() call,
+# so the token does not end up in fetch's Referer/logs for anything else.
+TOKEN_QUERY_PARAM = 'tt_token'
+_TOKEN_QUERY_PATHS = re.compile(r'^/api/jobs/[^/]+/(preview|source)/')
+
 # Settings and the app's own pick log live beside the work directory, i.e.
 # under ~/.cache (or LOCALAPPDATA), NEVER inside the project. Same reason the
 # work directory moved there: this repo sits in a OneDrive tree, and a file
@@ -128,10 +153,15 @@ CALIB_PICKS = _paths.PICKS
 UPLOAD_CHUNK = 1 << 20                       # 1 MiB per read
 MAX_UPLOAD_MB = max(1, int(_os.environ.get('TT_MAX_UPLOAD_MB', '64')))
 
+RETENTION_DAYS = {'90d': 90, '30d': 30}    # 'forever' has no entry - never expires
+
 DEFAULT_SETTINGS = {
     'dest': '',            # last folder saved to - survives a restart
     'share_stats': False,  # opt-IN. Nothing ever leaves this machine unasked.
     'role': 'user',        # 'owner' marks the reviewer's own install in shared rows
+    'auto_update': False,  # item 3.5. Off by default; Windows-only regardless
+                            # of this value (server enforces it, not just the UI).
+    'retention': 'forever', # item 7: 'forever' | '90d' | '30d'
 }
 
 
@@ -308,7 +338,9 @@ def load_jobs() -> None:
         try:
             job = json.loads(f.read_text())
         except (OSError, json.JSONDecodeError):
-            continue
+            continue                     # corrupt/truncated job.json: skip it
+        if not isinstance(job, dict):
+            continue                     # valid JSON, wrong shape - same idea
         # Rebuild the paths from where the folder actually IS rather than
         # trusting what was written. job.json used to carry absolute paths, so
         # moving the work directory (out of OneDrive, for one) silently
@@ -317,8 +349,12 @@ def load_jobs() -> None:
         job['src_dir'] = str(d / 'in')
         job['out_dir'] = str(d / 'out')
         job['id'] = d.name
-        # A job interrupted by a quit would otherwise sit at "tracing" forever.
-        if job.get('status') == 'tracing':
+        # No thread survives a restart to finish either of these, so both
+        # would otherwise sit in History forever looking like they are still
+        # running - 'tracing' was already fixed; 'queued' (killed while
+        # waiting on the batch lock, before it ever started) is the same
+        # failure and was missed - error-path audit, item 3.55.
+        if job.get('status') in ('tracing', 'queued'):
             job['status'] = 'interrupted'
         JOBS[job['id']] = job
 
@@ -383,12 +419,37 @@ def _run_job_inner(job_id: str) -> None:
 app = FastAPI(title='T-Tracer')
 
 
-async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> bool:
-    """Stream one upload to `dest`. False (and no file left behind) if oversized.
+@app.middleware('http')
+async def _require_session_token(request: Request, call_next):
+    """Every /api/ request needs the launch token; the static frontend does not.
+
+    The static mount (index.html, app.js, app.css, icons) is intentionally
+    left open: the page itself has to load before it can learn the token, and
+    it carries no capability - reading app.js is not the same risk as being
+    able to call POST /api/jobs or DELETE /api/jobs/{id}.
+    """
+    if request.url.path.startswith('/api/'):
+        token = request.headers.get(TOKEN_HEADER)
+        if token is None and _TOKEN_QUERY_PATHS.match(request.url.path):
+            token = request.query_params.get(TOKEN_QUERY_PARAM)
+        # compare_digest: a plain != leaks how many leading characters matched.
+        if token is None or not hmac.compare_digest(token, SESSION_TOKEN):
+            return JSONResponse({'detail': 'missing or invalid session token'},
+                                status_code=401)
+    return await call_next(request)
+
+
+async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> str:
+    """Stream one upload to `dest`. Returns 'ok', 'oversized' or 'error'.
 
     The partial file is removed on ANY exit that is not a clean complete write,
     including a disconnect mid-upload. A truncated image in the job folder would
     be picked up by the tracer as though it were a real input.
+
+    'oversized' and 'error' used to be the same outcome (both just `False`),
+    which meant a disk-full write (error-path audit, item 3.55: simulated with
+    OSError(ENOSPC)) was reported to the user as "over the upload size limit" -
+    true of nothing on their end and actively misleading about what to fix.
     """
     written = 0
     try:
@@ -396,17 +457,18 @@ async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> bool:
             while chunk := await f.read(UPLOAD_CHUNK):
                 written += len(chunk)
                 if written > max_bytes:
-                    raise ValueError('over limit')
+                    dest.unlink(missing_ok=True)
+                    return 'oversized'
                 out.write(chunk)
-    except BaseException:
+    except Exception:                                      # noqa: BLE001
         dest.unlink(missing_ok=True)
-        return False
-    return True
+        return 'error'
+    return 'ok'
 
 
 @app.post('/api/jobs')
 async def create_job(files: list[UploadFile]):
-    accepted, rejected, oversized = [], [], []
+    accepted, rejected, oversized, failed = [], [], [], []
     job_id = uuid.uuid4().hex[:12]
     src = WORK / job_id / 'in'
     out = WORK / job_id / 'out'
@@ -426,8 +488,12 @@ async def create_job(files: list[UploadFile]):
             n += 1
             stem = f'{Path(name).stem} ({n})'
         dest = src / f'{stem}{suf}'
-        if not await _save_upload(f, dest, MAX_UPLOAD_MB * 1024 * 1024):
+        result = await _save_upload(f, dest, MAX_UPLOAD_MB * 1024 * 1024)
+        if result == 'oversized':
             oversized.append(name)
+            continue
+        if result == 'error':
+            failed.append(name)
             continue
         accepted.append(dest.name)
 
@@ -439,6 +505,12 @@ async def create_job(files: list[UploadFile]):
                           + ', '.join(oversized))
         if rejected:
             detail.append('not an image: ' + ', '.join(rejected))
+        if failed:
+            # Distinct from "oversized" on purpose (error-path audit, item
+            # 3.55): telling someone their file is too big when the real
+            # problem is the destination disk sends them fixing the wrong thing.
+            detail.append('could not be saved (disk full or unwritable): '
+                          + ', '.join(failed))
         raise HTTPException(400, 'No usable images. ' + '; '.join(detail))
 
     from datetime import datetime
@@ -446,10 +518,11 @@ async def create_job(files: list[UploadFile]):
                     'total': len(accepted), 'src_dir': str(src),
                     'out_dir': str(out), 'errors': [], 'rejected': rejected,
                     'created': datetime.now().isoformat(timespec='seconds'),
-                    'names': accepted, 'oversized': oversized}
+                    'names': accepted, 'oversized': oversized, 'failed': failed}
     save_job(JOBS[job_id])
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
-    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected, 'oversized': oversized}
+    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected,
+            'oversized': oversized, 'failed': failed}
 
 
 @app.get('/api/jobs/{job_id}')
@@ -457,8 +530,13 @@ def job_status(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, 'unknown job')
-    return {k: job[k] for k in
-            ('id', 'status', 'done', 'total', 'errors', 'rejected')}
+    # .get() with defaults, not job[k]: a job.json truncated by a kill mid-save
+    # (or mid-write to disk-full) can be valid JSON missing some of these keys
+    # entirely, and a plain KeyError here used to turn that into a 500 on
+    # every poll of that job - error-path audit, item 3.55.
+    return {'id': job.get('id', job_id), 'status': job.get('status', 'unknown'),
+            'done': job.get('done', 0), 'total': job.get('total', 0),
+            'errors': job.get('errors', []), 'rejected': job.get('rejected', [])}
 
 
 @app.get('/api/jobs/{job_id}/results')
@@ -479,7 +557,16 @@ def job_results(job_id: str):
         mp = d / 'metrics.json'
         if not mp.exists():
             continue
-        metrics = json.loads(mp.read_text())
+        # A trace killed mid-write (process killed, or disk full) can leave
+        # metrics.json truncated - valid on disk, not valid JSON. That used to
+        # be an unhandled JSONDecodeError, turning ONE bad image into a 500 for
+        # the whole job's results, including every OTHER image that traced
+        # fine. Skip just this image instead, same as the missing-file case
+        # right above it - error-path audit, item 3.55.
+        try:
+            metrics = json.loads(mp.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
         cands = []
         for i, (name, sc) in enumerate(C.rank_candidates(metrics), 1):
             if not (d / f'{name}.png').exists():
@@ -583,6 +670,91 @@ def forget_job(job_id: str):
     return {'ok': True}
 
 
+# --------------------------------------------------------------------------
+# Item 7: history/storage controls.
+#
+# Everything a job writes lives under WORK/<job_id>/ - settings.json and
+# app-picks.jsonl sit one level up, at WORK.parent, and the calibration
+# picks.jsonl (CALIB_PICKS) lives entirely outside WORK, under _private/. A
+# cleanup that only ever does shutil.rmtree(WORK / job_id) therefore CANNOT
+# reach any of those, structurally, not by convention - "cleanup must never
+# destroy settings/picks/field statistics" holds even if this code has a bug
+# in which job_ids it picks.
+# --------------------------------------------------------------------------
+
+# A job in either of these states has a thread (or a restart-recovery path)
+# that still owns its folder. Cleanup must never touch it out from under
+# that - "active/queued jobs are never removed by cleanup".
+ACTIVE_STATUSES = {'queued', 'tracing'}
+
+
+def select_jobs_to_clean(jobs: dict[str, dict], cutoff: str | None = None) -> list[str]:
+    """Which job ids a cleanup pass may delete. Pure - no disk I/O, easy to test.
+
+    `cutoff`: an ISO 'created' timestamp. None means "every finished job,
+    regardless of age" (the manual Clear button); given, only jobs created
+    strictly before it qualify (the automatic retention sweep).
+    """
+    return [job_id for job_id, job in jobs.items()
+            if job.get('status') not in ACTIVE_STATUSES
+            and (cutoff is None or str(job.get('created', '')) < cutoff)]
+
+
+def _dir_size(path: Path) -> int:
+    if not path.is_dir():
+        return 0
+    total = 0
+    for p in path.rglob('*'):
+        if p.is_file():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass                      # a file that vanished mid-scan is not fatal
+    return total
+
+
+def _clean_jobs(job_ids: list[str]) -> int:
+    """Delete the given job folders. Returns bytes freed."""
+    freed = 0
+    for job_id in job_ids:
+        freed += _dir_size(WORK / job_id)
+        shutil.rmtree(WORK / job_id, ignore_errors=True)
+        JOBS.pop(job_id, None)
+    return freed
+
+
+def _apply_retention() -> None:
+    """Automatic cleanup by the configured retention window, run once at launch.
+
+    After load_jobs() so JOBS reflects what is actually on disk, and before
+    the server starts accepting requests, so an install nobody opens Settings
+    on still shrinks rather than growing forever at 'forever' by default doing
+    nothing until someone changes it.
+    """
+    days = RETENTION_DAYS.get(load_settings().get('retention', 'forever'))
+    if not days:
+        return                            # 'forever' (or an unknown value): no-op
+    from datetime import datetime, timedelta
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat(timespec='seconds')
+    _clean_jobs(select_jobs_to_clean(JOBS, cutoff))
+
+
+@app.get('/api/storage')
+def storage():
+    """Disk used by everything History can show - the number the Settings
+    tab's "X used" line reports, and what Clear/retention actually reclaim."""
+    return {'bytes': _dir_size(WORK), 'jobs': len(JOBS)}
+
+
+@app.post('/api/history/clear')
+def clear_history():
+    """The manual 'Clear generated history' button: every FINISHED job, now,
+    regardless of age. Active/queued jobs are skipped - see select_jobs_to_clean."""
+    ids = select_jobs_to_clean(JOBS)
+    freed = _clean_jobs(ids)
+    return {'cleared': len(ids), 'bytes_freed': freed}
+
+
 @app.get('/api/pick-folder')
 def pick_folder():
     """Native folder chooser, server-side.
@@ -646,11 +818,17 @@ class Settings(BaseModel):
     dest: str | None = None
     share_stats: bool | None = None
     role: str | None = None
+    auto_update: bool | None = None
+    retention: str | None = None
 
 
 @app.get('/api/settings')
 def get_settings():
-    return load_settings()
+    # 'platform' is computed, never persisted - it rides along so the
+    # Settings tab can hide/disable the auto-update toggle on anything that
+    # is not Windows without a second round trip. It is dropped again by
+    # write_settings() (only DEFAULT_SETTINGS keys survive a PUT).
+    return {**load_settings(), 'platform': sys.platform}
 
 
 @app.put('/api/settings')
@@ -663,7 +841,10 @@ def put_settings(req: Settings):
     empty against the new one. Storing it next to the work directory makes it
     independent of whichever port the app happened to get.
     """
-    return write_settings(req.model_dump(exclude_none=True))
+    patch = req.model_dump(exclude_none=True)
+    if 'retention' in patch and patch['retention'] not in ('forever', *RETENTION_DAYS):
+        raise HTTPException(400, "retention must be 'forever', '90d' or '30d'")
+    return write_settings(patch)
 
 
 class JudgeRow(BaseModel):
@@ -755,6 +936,35 @@ def stats_report():
     }
 
 
+# --------------------------------------------------------------------------
+# Item 3.5: auto-update. Shared by the reporting-only check above and the
+# actual downloader below, so a change to how "newer" is decided cannot
+# silently diverge between what the UI shows and what the updater acts on.
+# --------------------------------------------------------------------------
+
+def _version_parts(v: str) -> list[int]:
+    out = []
+    for chunk in v.split('.'):
+        digits = ''.join(c for c in chunk if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    return out
+
+
+def _fetch_latest_release() -> dict | None:
+    """The full GitHub release payload (assets included), or None on any
+    failure - offline, rate limited, no releases yet. Never raises."""
+    import urllib.request
+    url = f'https://api.github.com/repos/{REPO}/releases/latest'
+    try:
+        req = urllib.request.Request(
+            url, headers={'Accept': 'application/vnd.github+json',
+                          'User-Agent': f't-tracer/{APP_VERSION}'})
+        with urllib.request.urlopen(req, timeout=4) as r:
+            return json.loads(r.read().decode())
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 @app.get('/api/update-check')
 def update_check():
     """Ask GitHub for the newest release. Fails silently and never blocks.
@@ -763,30 +973,115 @@ def update_check():
     limited, or a repo with no releases yet all return the same quiet
     'no update' rather than an error the user has to dismiss.
     """
-    import urllib.request
-    url = f'https://api.github.com/repos/{REPO}/releases/latest'
-    try:
-        req = urllib.request.Request(
-            url, headers={'Accept': 'application/vnd.github+json',
-                          'User-Agent': f't-tracer/{APP_VERSION}'})
-        with urllib.request.urlopen(req, timeout=4) as r:
-            data = json.loads(r.read().decode())
-    except Exception:                                      # noqa: BLE001
+    data = _fetch_latest_release()
+    if data is None:
         return {'current': APP_VERSION, 'checked': False}
 
     tag = str(data.get('tag_name') or '').lstrip('vV')
-
-    def parts(v):
-        out = []
-        for chunk in v.split('.'):
-            digits = ''.join(c for c in chunk if c.isdigit())
-            out.append(int(digits) if digits else 0)
-        return out
-
-    newer = bool(tag) and parts(tag) > parts(APP_VERSION)
+    newer = bool(tag) and _version_parts(tag) > _version_parts(APP_VERSION)
     return {'current': APP_VERSION, 'checked': True, 'latest': tag or None,
             'update': newer, 'url': data.get('html_url'),
             'notes': (data.get('body') or '')[:400]}
+
+
+# --------------------------------------------------------------------------
+# The install half of item 3.5. "Do item 6 (SHA-256 verification) first - an
+# auto-updater that runs an unverified download is strictly worse than no
+# auto-updater" - so this never runs the downloaded .exe without a checksum
+# that matches, ships with build-installer.yml computing and publishing that
+# checksum as its own release asset (T-Tracer-Setup.exe.sha256).
+# --------------------------------------------------------------------------
+
+def _release_assets(data: dict) -> dict[str, str]:
+    """name -> browser_download_url for every asset on a release payload."""
+    return {a['name']: a['browser_download_url']
+            for a in (data.get('assets') or []) if a.get('name') and a.get('browser_download_url')}
+
+
+def verify_sha256(path: Path, expected: str) -> bool:
+    """True iff `path` hashes to `expected`. Accepts either a bare hex digest
+    (Get-FileHash's own format, matching app/install.ps1's PyInstallerSha256)
+    or a `sha256sum`-style 'hex  filename' line - only the first token is used."""
+    import hashlib
+    digest = hashlib.sha256()
+    with path.open('rb') as f:
+        while chunk := f.read(1 << 20):
+            digest.update(chunk)
+    token = expected.strip().split()[0] if expected.strip() else ''
+    return bool(token) and digest.hexdigest().lower() == token.lower()
+
+
+def _download(url: str, dest: Path) -> None:
+    """Stream a URL to disk. Raises on any failure - the caller decides what
+    'could not update' means; this function never swallows an error, because
+    swallowing it here is how a truncated .exe would end up looking verified."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': f't-tracer/{APP_VERSION}'})
+    with urllib.request.urlopen(req, timeout=120) as r, dest.open('wb') as out:
+        while chunk := r.read(UPLOAD_CHUNK):
+            out.write(chunk)
+
+
+# Read by GET /api/update-status so the frontend can surface a checksum
+# failure or a missing release asset - the one case that is NOT silent, per
+# item 3.5's own "mismatch or missing checksum => do not run, surface a clear
+# error". Never written to disk; a restart clears it, same as SESSION_TOKEN.
+UPDATE_STATE: dict = {'status': 'idle', 'detail': ''}
+
+
+def _auto_update_once() -> None:
+    """Runs once per launch, in a background thread - see serve(). Every
+    return before the download is a SILENT no-op by design (item 3.5: offline
+    / no update / declined must not be an error the user has to dismiss)."""
+    global UPDATE_STATE
+    if sys.platform != 'win32':
+        return                            # never attempt an install off Windows,
+                                           # regardless of what settings.json says
+    if not load_settings().get('auto_update'):
+        return
+    data = _fetch_latest_release()
+    if data is None:
+        return                            # offline / rate limited: silent
+    tag = str(data.get('tag_name') or '').lstrip('vV')
+    if not tag or _version_parts(tag) <= _version_parts(APP_VERSION):
+        return                            # no update available: silent
+    assets = _release_assets(data)
+    exe_name = next((n for n in assets if n.lower().endswith('.exe')), None)
+    sha_name = next((n for n in assets if n.lower().endswith('.sha256')), None)
+    if not exe_name or not sha_name:
+        UPDATE_STATE = {'status': 'error',
+                        'detail': f'Release {tag} is missing the installer or its '
+                                  'checksum file. Not downloading.'}
+        return
+    tmp = WORK.parent / 'update'
+    try:
+        tmp.mkdir(parents=True, exist_ok=True)
+        exe_path, sha_path = tmp / exe_name, tmp / sha_name
+        _download(assets[exe_name], exe_path)
+        _download(assets[sha_name], sha_path)
+        if not verify_sha256(exe_path, sha_path.read_text()):
+            exe_path.unlink(missing_ok=True)
+            UPDATE_STATE = {'status': 'error',
+                            'detail': f'{exe_name} failed its checksum check after '
+                                      'download. Not run - try again later.'}
+            return
+        import subprocess
+        subprocess.Popen([str(exe_path)], close_fds=True)
+        UPDATE_STATE = {'status': 'installing', 'detail': f'Installing {tag}…'}
+    except Exception as e:                                 # noqa: BLE001
+        UPDATE_STATE = {'status': 'error', 'detail': f'Auto-update failed: {e}'}
+        return
+    # The running app and the installer it just launched cannot both hold the
+    # install directory - item 3.5: "run it, exit the app". os._exit() rather
+    # than a normal return: uvicorn is serving on another thread and would
+    # otherwise keep the process (and this window) alive underneath the
+    # installer.
+    _os._exit(0)                                           # noqa: SLF001
+
+
+@app.get('/api/update-status')
+def update_status():
+    return UPDATE_STATE
 
 
 @app.get('/api/health')
@@ -820,6 +1115,16 @@ def serve(host='127.0.0.1', port=8765):
     migrate_legacy_dir()
     WORK.mkdir(parents=True, exist_ok=True)
     load_jobs()
+    _apply_retention()
+    # main.py reads SESSION_TOKEN off the module directly and puts it in the
+    # window URL, so the normal launch path never needs this. It is printed
+    # here only for `python server.py` directly - the "Try: python server.py"
+    # fallback main.py itself suggests - where there is no other way to learn
+    # the token the API now requires.
+    print(f'T-Tracer: session token for direct API use: {SESSION_TOKEN}')
+    # Backgrounded so a slow/offline GitHub check never delays the window
+    # opening - main.py is already polling wait_for(port) for exactly that.
+    threading.Thread(target=_auto_update_once, daemon=True).start()
     uvicorn.run(app, host=host, port=port, log_level='warning')
 
 

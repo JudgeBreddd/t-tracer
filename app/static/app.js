@@ -7,6 +7,27 @@
  * that away. */
 
 const $ = (s) => document.querySelector(s);
+
+/* ---------------- session token (item 8) ----------------
+ * main.py puts the launch token in the page URL because there is nowhere
+ * else for a freshly loaded static page to learn it from - it is generated
+ * fresh per launch and never persisted. Read once here and attached to every
+ * API call from then on. */
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+function apiFetch(url, opts = {}) {
+  const headers = new Headers(opts.headers || {});
+  if (TOKEN) headers.set('X-T-Tracer-Token', TOKEN);
+  return fetch(url, { ...opts, headers });
+}
+// <img src> can't carry a header, so the two read-only image endpoints
+// (preview and source) take the token as a query param instead. Applied once,
+// where the URLs first arrive from the server (loadResults), so every
+// consumer of img.source / candidate.preview - cards, the viewer - gets a
+// working URL for free without needing to know about tokens at all.
+function withToken(url) {
+  if (!url || !TOKEN) return url;
+  return url + (url.includes('?') ? '&' : '?') + 'tt_token=' + encodeURIComponent(TOKEN);
+}
 // `images` ACCUMULATES across drops. Each entry carries the job it came from,
 // because preview URLs and the save endpoint are both job-scoped. The first
 // version replaced the list on every upload, so adding a second logo silently
@@ -27,7 +48,7 @@ let settings = { dest: '', share_stats: false, role: 'user' };
 
 async function loadSettings() {
   try {
-    settings = await (await fetch('/api/settings')).json();
+    settings = await (await apiFetch('/api/settings')).json();
     $('#dest').value = settings.dest || '';
   } catch (_) { /* defaults are fine */ }
   refreshAction();
@@ -36,7 +57,7 @@ async function loadSettings() {
 async function saveSettings(patch) {
   Object.assign(settings, patch);
   try {
-    await fetch('/api/settings', {
+    await apiFetch('/api/settings', {
       method: 'PUT', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
     });
@@ -58,7 +79,7 @@ $('#browse').addEventListener('click', async () => {
       if (p) setDest(p);
       return;
     }
-    const r = await fetch('/api/pick-folder');
+    const r = await apiFetch('/api/pick-folder');
     const j = await r.json();
     if (j.path) setDest(j.path);
     else if (j.unavailable) {
@@ -100,12 +121,15 @@ async function upload(fileList) {
   $('#barfill').style.width = '2%';
   $('#progresstext').textContent = 'Uploading…';
   try {
-    const r = await fetch('/api/jobs', { method: 'POST', body: fd });
+    const r = await apiFetch('/api/jobs', { method: 'POST', body: fd });
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const j = await r.json();
     state.jobId = j.job_id;
     if (j.rejected?.length) toast(`Skipped ${j.rejected.length} non-image file(s).`, true);
     if (j.oversized?.length) toast(`Skipped ${j.oversized.length} file(s) over the upload size limit.`, true);
+    // Distinct from "oversized" - a write failure (e.g. the disk is full) is
+    // not a limit the user can fix by picking a smaller file.
+    if (j.failed?.length) toast(`Could not save ${j.failed.length} file(s) - check disk space.`, true);
     poll(j.job_id);
   } catch (err) {
     $('#progress').hidden = true;
@@ -115,7 +139,7 @@ async function upload(fileList) {
 
 /* ---------------- progress ---------------- */
 async function poll(jobId) {
-  const r = await fetch(`/api/jobs/${jobId}`);
+  const r = await apiFetch(`/api/jobs/${jobId}`);
   const j = await r.json();
   const pct = j.total ? Math.round((j.done / j.total) * 100) : 0;
   $('#barfill').style.width = `${Math.max(pct, 3)}%`;
@@ -135,13 +159,19 @@ async function poll(jobId) {
 
 /* ---------------- results ---------------- */
 async function loadResults(jobId) {
-  const r = await fetch(`/api/jobs/${jobId}/results`);
+  const r = await apiFetch(`/api/jobs/${jobId}/results`);
   const fresh = (await r.json()).images;
   const box = $('#results');
   box.hidden = false;
 
   fresh.forEach((img) => {
     img.jobId = jobId;
+    // Preview/source URLs are loaded via <img src>, which cannot carry the
+    // auth header apiFetch uses - stamp the token on as a query param here,
+    // once, so every consumer downstream (cards, the full-size viewer) just
+    // uses img.source / candidate.preview and gets a working URL for free.
+    img.source = withToken(img.source);
+    img.candidates.forEach((c) => { c.preview = withToken(c.preview); });
     // A repeat of the same filename would collide on `stem` as the key, so it
     // gets a display key that stays unique across drops. The saved SVG keeps
     // the plain name; the server handles that collision separately.
@@ -445,7 +475,7 @@ $('#save').addEventListener('click', async () => {
   const failures = [];
   try {
     for (const [jobId, picks] of Object.entries(byJob)) {
-      const r = await fetch(`/api/jobs/${jobId}/save`, {
+      const r = await apiFetch(`/api/jobs/${jobId}/save`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ dest, picks }),
       });
@@ -490,7 +520,7 @@ const cssEsc = (s) => (window.CSS?.escape ? CSS.escape(s) : String(s).replace(/[
  * the one i download doesnt work, i can grab the another one from a previous
  * run." */
 const TABS = { current: $('#tab-current'), history: $('#tab-history'),
-               stats: $('#tab-stats') };
+               stats: $('#tab-stats'), settings: $('#tab-settings') };
 
 function showTab(which) {
   Object.entries(TABS).forEach(([name, el]) => {
@@ -500,12 +530,14 @@ function showTab(which) {
   const cur = which === 'current';
   $('#history').hidden = which !== 'history';
   $('#stats').hidden = which !== 'stats';
+  $('#settings').hidden = which !== 'settings';
   $('#drop').hidden = !cur;
   $('#howto').hidden = !cur;
   $('#results').hidden = !cur || !state.images.length;
   $('#actionbar').hidden = !cur || !state.images.length;
   if (which === 'history') loadHistory();
   if (which === 'stats') loadStats();
+  if (which === 'settings') loadSettingsTab();
 }
 Object.keys(TABS).forEach((name) =>
   TABS[name].addEventListener('click', () => showTab(name)));
@@ -514,7 +546,7 @@ async function loadHistory() {
   const box = $('#history');
   box.innerHTML = '<p class="hempty">Loading…</p>';
   try {
-    const { jobs } = await (await fetch('/api/history')).json();
+    const { jobs } = await (await apiFetch('/api/history')).json();
     const open = new Set(state.images.map((i) => i.jobId));
     if (!jobs.length) {
       box.innerHTML = '<p class="hempty">Nothing traced yet.</p>';
@@ -543,7 +575,7 @@ async function loadHistory() {
       del.textContent = 'Delete';
       del.title = 'Remove this run and its traced files from disk';
       del.addEventListener('click', async () => {
-        await fetch(`/api/jobs/${j.id}`, { method: 'DELETE' });
+        await apiFetch(`/api/jobs/${j.id}`, { method: 'DELETE' });
         state.images = state.images.filter((i) => i.jobId !== j.id);
         document.querySelectorAll('.card').forEach((c) => {
           if (!state.images.some((i) => i.key === c.dataset.card)) c.remove();
@@ -586,7 +618,7 @@ async function recordJudgement(imgs) {
   imgs.forEach((img) => { (byJob[img.jobId] ||= []).push(judgementFor(img)); });
   for (const [jobId, rows] of Object.entries(byJob)) {
     try {
-      await fetch(`/api/jobs/${jobId}/judge`, {
+      await apiFetch(`/api/jobs/${jobId}/judge`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(rows),
       });
@@ -623,7 +655,7 @@ async function loadStats() {
   box.innerHTML = '<p class="hempty">Loading…</p>';
   let d;
   try {
-    d = await (await fetch('/api/stats')).json();
+    d = await (await apiFetch('/api/stats')).json();
   } catch (_) {
     box.innerHTML = '<p class="hempty">Could not load statistics.</p>';
     return;
@@ -814,7 +846,7 @@ function shareGroup(d) {
 
   build.addEventListener('click', async () => {
     try {
-      const r = await fetch('/api/stats/report');
+      const r = await apiFetch('/api/stats/report');
       const j = await r.json();
       if (!r.ok) { toast(j.detail || 'Could not build the report.', true); return; }
       const text = JSON.stringify(j, null, 2);
@@ -845,6 +877,166 @@ function shareGroup(d) {
 }
 
 
+/* ---------------- settings tab (item 7: history storage controls) ----------------
+ * "Settings shows storage used; Clear generated history button; retention
+ * option (Forever / 90 days / 30 days, default Forever)." Cleanup itself
+ * lives entirely server-side (select_jobs_to_clean in server.py) - this is
+ * just the display and the two controls that trigger it. */
+function humanBytes(n) {
+  if (n == null) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let v = n, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+async function loadSettingsTab() {
+  const box = $('#settings');
+  box.innerHTML = '<p class="hempty">Loading…</p>';
+  let storageInfo;
+  try {
+    storageInfo = await (await apiFetch('/api/storage')).json();
+  } catch (_) {
+    box.innerHTML = '<p class="hempty">Could not load settings.</p>';
+    return;
+  }
+  // Re-fetch settings rather than trusting the module-level cache: this tab
+  // can be the first thing opened after a fresh /api/settings PUT elsewhere,
+  // and it needs 'platform' too, which loadSettings() at boot already fetched
+  // but the auto-update toggle below reads off `settings` directly.
+  try { settings = await (await apiFetch('/api/settings')).json(); } catch (_) {}
+  let updateState = { status: 'idle', detail: '' };
+  try { updateState = await (await apiFetch('/api/update-status')).json(); } catch (_) {}
+
+  box.innerHTML = '';
+  box.appendChild(storageGroup(storageInfo));
+  box.appendChild(autoUpdateGroup(updateState));
+}
+
+/* Item 3.5: the toggle only ever writes settings.auto_update=true/false - the
+ * actual download/verify/install runs server-side, once per launch, in the
+ * background (server.py _auto_update_once). This group just shows the
+ * result of the last attempt (update-status) and lets Windows users opt in. */
+function autoUpdateGroup(updateState) {
+  const g = document.createElement('section');
+  g.className = 'statgroup';
+  g.innerHTML = '<h2>Automatic updates</h2>';
+
+  const sub = document.createElement('p');
+  sub.className = 'sub';
+  const isWindows = settings.platform === 'win32';
+  sub.textContent = isWindows
+    ? 'When on, T-Tracer checks for a newer release at startup, downloads it, '
+      + 'verifies it against the checksum published with the release, and '
+      + 'installs it automatically - the running app closes to let the '
+      + 'installer run. Off by default. A failed or missing checksum is never '
+      + 'run; a declined or offline check is silent.'
+    : 'Available on Windows installs only - T-Tracer never downloads or runs '
+      + 'an installer on this platform.';
+  g.appendChild(sub);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'share';
+  const label = document.createElement('label');
+  label.className = 'optin';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = !!settings.auto_update;
+  cb.disabled = !isWindows;
+  const span = document.createElement('span');
+  span.textContent = 'Automatically download and install updates';
+  label.append(cb, span);
+  cb.addEventListener('change', () => saveSettings({ auto_update: cb.checked }));
+  wrap.appendChild(label);
+
+  if (updateState && updateState.status === 'error') {
+    const err = document.createElement('p');
+    err.className = 'sub';
+    err.style.color = 'var(--accent-red-bright)';
+    err.textContent = updateState.detail;
+    wrap.appendChild(err);
+  } else if (updateState && updateState.status === 'installing') {
+    const info = document.createElement('p');
+    info.className = 'sub';
+    info.textContent = updateState.detail;
+    wrap.appendChild(info);
+  }
+
+  g.appendChild(wrap);
+  return g;
+}
+
+function storageGroup(info) {
+  const g = document.createElement('section');
+  g.className = 'statgroup';
+  g.innerHTML = `<h2>History storage</h2>
+    <p class="sub">Every traced job's source images, previews and candidate
+      SVGs, kept so History can reopen them. Settings, your judged picks and
+      the calibration statistics are never touched by anything on this page.</p>`;
+
+  const nums = document.createElement('div');
+  nums.className = 'bignums';
+  nums.append(
+    bignum(humanBytes(info.bytes), 'used', `${info.jobs} job${info.jobs === 1 ? '' : 's'} in history`),
+  );
+  g.appendChild(nums);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'share';
+
+  const retLabel = document.createElement('p');
+  retLabel.className = 'sub';
+  retLabel.style.margin = '0 0 4px';
+  retLabel.textContent = 'Keep history:';
+  const retWrap = document.createElement('div');
+  retWrap.style.cssText = 'display:flex; gap:16px; flex-wrap:wrap';
+  const options = [['forever', 'Forever'], ['90d', '90 days'], ['30d', '30 days']];
+  options.forEach(([value, text]) => {
+    const label = document.createElement('label');
+    label.className = 'optin';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'retention';
+    input.value = value;
+    input.checked = (settings.retention || 'forever') === value;
+    input.addEventListener('change', () => { if (input.checked) saveSettings({ retention: value }); });
+    const span = document.createElement('span');
+    span.textContent = text;
+    label.append(input, span);
+    retWrap.appendChild(label);
+  });
+
+  const actions = document.createElement('div');
+  actions.className = 'share-actions';
+  const clearBtn = document.createElement('button');
+  clearBtn.className = 'ghost';
+  clearBtn.type = 'button';
+  clearBtn.textContent = 'Clear generated history';
+  clearBtn.title = 'Deletes finished jobs\' files. Active/queued jobs, settings, '
+    + 'and your judged picks are never touched.';
+  clearBtn.addEventListener('click', async () => {
+    clearBtn.disabled = true;
+    try {
+      const r = await apiFetch('/api/history/clear', { method: 'POST' });
+      const j = await r.json();
+      toast(`Cleared ${j.cleared} job${j.cleared === 1 ? '' : 's'} — freed ${humanBytes(j.bytes_freed)}.`);
+      // Anything cleared may still be open in Current/History - drop it from
+      // both rather than leaving a card pointing at files that no longer exist.
+      loadSettingsTab();
+    } catch (err) {
+      toast(String(err.message || err), true);
+    } finally {
+      clearBtn.disabled = false;
+    }
+  });
+
+  actions.appendChild(clearBtn);
+  wrap.append(retLabel, retWrap, actions);
+  g.appendChild(wrap);
+  return g;
+}
+
+
 /* ---------------- update check (item 6) ----------------
  * Reports, never installs. One call to the GitHub releases API at startup; if
  * it fails, is rate limited, or there are no releases yet, the bar simply does
@@ -853,7 +1045,7 @@ function shareGroup(d) {
 async function checkUpdate() {
   let d;
   try {
-    d = await (await fetch('/api/update-check')).json();
+    d = await (await apiFetch('/api/update-check')).json();
   } catch (_) { return; }
   if (!d.update) return;
   let dismissed = null;

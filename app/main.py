@@ -156,7 +156,13 @@ def main() -> int:
                      kwargs={'host': '127.0.0.1', 'port': port},
                      daemon=True).start()
 
-    url = f'http://127.0.0.1:{port}/'
+    # SESSION_TOKEN exists on the module the instant it is imported (it is a
+    # plain module-level assignment, not something serve() sets up), so it is
+    # already fixed by the time this thread starts - reading it here rather
+    # than waiting on the thread is safe. Item 8: the page has no other way to
+    # learn the token, since it is generated fresh per launch and never
+    # written anywhere the frontend could otherwise read it from.
+    url = f'http://127.0.0.1:{port}/?token={server.SESSION_TOKEN}'
     if not wait_for(port):
         log(f'Backend did not start. Try: python server.py', file=sys.stderr)
         return 1
