@@ -14,7 +14,9 @@ bound to loopback only.
 """
 from __future__ import annotations
 
+import hmac
 import json
+import re
 import secrets
 import shutil
 import sys
@@ -107,6 +109,7 @@ TOKEN_HEADER = 'X-T-Tracer-Token'
 # param when it builds those URLs; it never appends it to a real fetch() call,
 # so the token does not end up in fetch's Referer/logs for anything else.
 TOKEN_QUERY_PARAM = 'tt_token'
+_TOKEN_QUERY_PATHS = re.compile(r'^/api/jobs/[^/]+/(preview|source)/')
 
 # Settings and the app's own pick log live beside the work directory, i.e.
 # under ~/.cache (or LOCALAPPDATA), NEVER inside the project. Same reason the
@@ -426,9 +429,11 @@ async def _require_session_token(request: Request, call_next):
     able to call POST /api/jobs or DELETE /api/jobs/{id}.
     """
     if request.url.path.startswith('/api/'):
-        token = (request.headers.get(TOKEN_HEADER)
-                 or request.query_params.get(TOKEN_QUERY_PARAM))
-        if token != SESSION_TOKEN:
+        token = request.headers.get(TOKEN_HEADER)
+        if token is None and _TOKEN_QUERY_PATHS.match(request.url.path):
+            token = request.query_params.get(TOKEN_QUERY_PARAM)
+        # compare_digest: a plain != leaks how many leading characters matched.
+        if token is None or not hmac.compare_digest(token, SESSION_TOKEN):
             return JSONResponse({'detail': 'missing or invalid session token'},
                                 status_code=401)
     return await call_next(request)
