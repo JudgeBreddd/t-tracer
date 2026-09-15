@@ -72,12 +72,11 @@ echo "==> Installing torch (CPU) + controlnet_aux"
 # autodetects, so a CUDA box gets the speedup with no config.
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "    NVIDIA GPU detected - installing CUDA torch"
-  "$LINEART_VENV/bin/python" -m pip install torch torchvision --quiet
+  "$LINEART_VENV/bin/python" -m pip install -r "$HERE/requirements-annotator.txt" --quiet
 else
-  "$LINEART_VENV/bin/python" -m pip install torch torchvision --quiet \
-      --index-url https://download.pytorch.org/whl/cpu
+  "$LINEART_VENV/bin/python" -m pip install -r "$HERE/requirements-annotator.txt" --quiet \
+      --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
 fi
-"$LINEART_VENV/bin/python" -m pip install controlnet_aux --quiet
 
 # ------------------------------------------------------- warm the model cache
 echo "==> Downloading the lineart model (~17 MB, once)"

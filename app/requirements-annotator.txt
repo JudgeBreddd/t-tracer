@@ -1,0 +1,12 @@
+# Annotator venv only (see install.sh / install.ps1) - the ControlNet
+# lineart detector used by the `nested` and `composite` strategies.
+#
+# Exact pins, verified installing on this machine's annotator venv
+# (~/.venvs/png2svg-lineart), 2026-09-14. torch/torchvision are pinned
+# WITHOUT a "+cpu" local-version suffix on purpose: PEP 440 treats a bare
+# "==X.Y.Z" specifier as matching any local version of X.Y.Z, so this same
+# pin resolves against both the CPU index (which serves "X.Y.Z+cpu" wheels)
+# and the default/CUDA index (plain "X.Y.Z") without editing per platform.
+torch==2.14.0
+torchvision==0.29.0
+controlnet_aux==0.0.10
