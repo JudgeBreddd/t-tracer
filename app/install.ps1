@@ -40,6 +40,14 @@ Write-Host ''
 # wheels for numpy/scipy/opencv/torch for weeks, and the Linux install already
 # died exactly that way on 3.14 (pydantic-core tried to build through Rust).
 $PyVersion = '3.12.8'
+# SHA-256 of python-3.12.8-amd64.exe from https://www.python.org/ftp/python/3.12.8/,
+# computed locally (sha256sum) and cross-checked against the MD5
+# (2f2ab2472a6aa29f8755c72c58f58f4b) python.org's release page publishes for
+# that same file - python.org does not publish a SHA-256 for this file, only
+# MD5, so MD5 is the strongest published reference available. Bumping
+# $PyVersion means downloading the new .exe and updating this hash to match -
+# the install must not run an installer this value does not verify.
+$PyInstallerSha256 = '71bd44e6b0e91c17558963557e4cdb80b483de9b0a0a9717f06cf896f95ab598'
 
 function Find-Python {
     foreach ($cmd in @('py -3.12', 'py -3', 'python')) {
@@ -81,6 +89,13 @@ if ($py) {
         Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
     } catch {
         Die "Could not download Python from python.org. Check the connection, or install Python 3.12 yourself and re-run this."
+    }
+    # Verify before executing anything: a compromised mirror or a
+    # man-in-the-middle download is otherwise run with no check at all.
+    $actualSha256 = (Get-FileHash -Path $installer -Algorithm SHA256).Hash
+    if ($actualSha256 -ne $PyInstallerSha256) {
+        Remove-Item $installer -ErrorAction SilentlyContinue
+        Die "Python installer failed integrity check: expected SHA-256 $PyInstallerSha256, got $actualSha256. Not running it - re-download and try again, or install Python 3.12 yourself."
     }
     # Per-user install: no admin rights needed, which matters because the whole
     # point is that someone can run this on a machine they do not administer.
@@ -130,13 +145,14 @@ if (-not (Test-Path $LinPy)) {
 Say 'Installing PyTorch and the annotator (this is the slow part, ~2 GB)'
 & $LinPy -m pip install --upgrade pip --quiet
 $cuda = $null -ne (Get-Command nvidia-smi -ErrorAction SilentlyContinue)
+$annotatorReq = Join-Path $AppDir 'requirements-annotator.txt'
 if ($cuda) {
     Warn 'NVIDIA GPU detected - installing the CUDA build'
-    & $LinPy -m pip install torch torchvision --quiet
+    & $LinPy -m pip install -r $annotatorReq --quiet
 } else {
-    & $LinPy -m pip install torch torchvision --quiet --index-url https://download.pytorch.org/whl/cpu
+    & $LinPy -m pip install -r $annotatorReq --quiet `
+        --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
 }
-& $LinPy -m pip install controlnet_aux --quiet
 if ($LASTEXITCODE -ne 0) { Die 'Could not install the annotator dependencies.' }
 
 Say 'Downloading the lineart model (~17 MB, once)'
