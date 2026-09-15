@@ -9,8 +9,8 @@ Review the contact sheets, choose the candidate to ship, and record why.
 
 For each image it opens the contact sheet, lists the candidates ranked by the
 (provisional) score, and waits for a number. The chosen SVG is copied into
-stages/06_deliverables/ under the job name. The decision is appended to
-candidates/picks.jsonl.
+_private/stages/06_deliverables/ under the job name. The decision is appended to
+_private/candidates/picks.jsonl.
 
 Why the log matters more than the copy
 --------------------------------------
@@ -50,14 +50,19 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import paths
+
 HERE = Path(__file__).resolve().parent
-CANDIDATES = HERE / 'candidates'
+# Candidates, picks and deliverables are all private - they are customer
+# artwork and the reviewer's judgments on it. paths.py resolves the one
+# directory they live under; see it for why that directory exists.
+CANDIDATES = paths.CANDIDATES
 SHEETS = CANDIDATES / '_sheets'
 # The pick log is the project's only calibration ground truth, so it stays in
 # ONE canonical file no matter which run produced the tiles being reviewed.
 # --dir moves where candidates are read from; it never moves where picks land.
-PICKS = HERE / 'candidates' / 'picks.jsonl'
-DELIVERABLES = HERE.parent / 'stages' / '06_deliverables'
+PICKS = paths.PICKS
+DELIVERABLES = paths.DELIVERABLES
 
 
 def load_picks():
@@ -238,7 +243,7 @@ def main():
     ap.add_argument('--dir', dest='cand_dir', default=None,
                     help='review a different candidates folder (e.g. '
                          'candidates-redgold). Picks still log to '
-                         'candidates/picks.jsonl.')
+                         '_private/candidates/picks.jsonl.')
     args = ap.parse_args()
 
     global CANDIDATES, SHEETS

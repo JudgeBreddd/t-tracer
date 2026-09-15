@@ -15,7 +15,7 @@ overfitting to n=3.
 This produces real labels at real coordinates. Same interaction as pick.py: one
 contact sheet opened in the image viewer, answers typed in the terminal.
 
-    ./.venv/bin/python _scripts/grade_crops.py <image.png|.svg> [--n 40]
+    ./.venv/bin/python _engine/grade_crops.py <image.png|.svg> [--n 40]
 
 Output: <out>/labels.jsonl - one row per crop, with its bbox, so any metric can
 be scored against it later. Crops are sampled ON THE SKELETON so every tile

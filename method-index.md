@@ -2,7 +2,7 @@
 
 One entry per strategy: the ordered steps it runs, and every parameter that
 touches its result. Built to drive the parameter sweep, not to explain the code
-— for *why* a method exists, read its docstring in `_scripts/candidates.py`.
+— for *why* a method exists, read its docstring in `_engine/candidates.py`.
 
 **Complete:** 10 default + 6 optional + 3 archived. Written 2026-09-08.
 
@@ -29,7 +29,7 @@ Two more things the index surfaced:
 
 ## The shared pipeline (runs for EVERY strategy)
 
-`run_one`, [candidates.py:1592](_scripts/candidates.py). In execution order:
+`run_one`, [candidates.py:1592](_engine/candidates.py). In execution order:
 
 | # | step | parameter | default | geometry? |
 |---|---|---|---|---|
@@ -317,7 +317,7 @@ by luminance at any number of classes. The difference is structural — which is
 
 ---
 
-# ARCHIVED — `_scripts/_archive/`
+# ARCHIVED — `_private/archive/scripts-archive/`
 
 Superseded by `candidates.py`. Kept for the parameter history: **`--scale 6`
 and `--smoothing 3` have been the defaults since v1 and have never been swept.**

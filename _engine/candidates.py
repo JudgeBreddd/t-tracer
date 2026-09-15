@@ -48,6 +48,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import paths
+
 import cv2
 import numpy as np
 from scipy.interpolate import splprep, splev
@@ -972,7 +974,7 @@ def _lineart_python() -> Path:
 def _cache_dir() -> Path:
     """Activation-map cache, kept OUT of the project.
 
-    It lived in _scripts/.lineart_cache, which is inside a OneDrive tree - the
+    It lived in _engine/.lineart_cache, which is inside a OneDrive tree - the
     same mistake the app's .work folder made. These are .npy blobs, one per
     image per detector resolution, and syncing them is pure waste.
     """
@@ -1739,7 +1741,7 @@ def mask_to_paths(mask, scale=6, smooth=3.0, tol=0.6, min_points=16):
 def paths_to_svg(paths, w, h, ink='#000000', background=None, height_mm=None):
     """Emit one <path> holding every subpath, fill-rule evenodd so interior
     holes knock out correctly. Exactly one fill color - the geometry IS the
-    job, per _shared/laser-output-rules.md.
+    job, per _engine/laser-output-rules.md.
 
     A background <rect> is omitted by default: in XCS a white rectangle is
     another closed shape to reason about, not 'nothing'.
@@ -2130,7 +2132,11 @@ def main():
     # `strat_linework` and `strat_plate`.
     cv2.setNumThreads(1)
 
-    folder = Path(__file__).resolve().parent
+    # Every use of `folder` below is a PRIVATE-data path - the corpus, the
+    # drop folder, the output root. It points at _private/, not at the code
+    # directory, so nothing this script reads or writes can land in the
+    # publishable tree. See paths.py for why.
+    folder = paths.PRIVATE
     out_root = folder / args.out
 
     if args.resheet:
@@ -2190,7 +2196,7 @@ def main():
         images = [p for p in images if p.name == args.only]
       if not images:
         # Fall back to the existing test-image folder rather than doing nothing.
-        testers = folder / 'converter script testers'
+        testers = folder / 'runs' / 'converter script testers'
         if testers.is_dir():
             images = sorted(p for p in testers.iterdir() if p.suffix.lower() in IMAGE_EXTS)
             if args.only:

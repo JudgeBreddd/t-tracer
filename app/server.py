@@ -2,9 +2,9 @@
 """T-Tracer - local backend.
 
 Wraps the existing pipeline rather than reimplementing any of it. `run_one` in
-`_scripts/candidates.py` is imported directly and called with exactly the CLI's
+`_engine/candidates.py` is imported directly and called with exactly the CLI's
 default arguments, so the app and the command line produce byte-identical SVGs.
-That matters: `_scripts/candidates/picks.jsonl` is the project's calibration
+That matters: `_private/candidates/picks.jsonl` is the project's calibration
 ground truth, and it would stop meaning anything if the app traced differently
 from the tool the picks were recorded with.
 
@@ -30,7 +30,10 @@ from pydantic import BaseModel
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT = APP_DIR.parent
-SCRIPTS = PROJECT / '_scripts'
+# The tracing engine. Renamed from _scripts/ on 2026-09-10: the folder holds
+# the algorithm, and app/ holds the interface, so "scripts" said nothing.
+ENGINE = PROJECT / '_engine'
+SCRIPTS = ENGINE          # back-compat alias; ENGINE is the name to use
 STATIC = APP_DIR / 'static'
 
 # Working files live OUTSIDE the project, and this is not optional.
@@ -56,8 +59,9 @@ def _work_dir() -> Path:
 
 WORK = _work_dir()
 
-sys.path.insert(0, str(SCRIPTS))
+sys.path.insert(0, str(ENGINE))
 import candidates as C                                   # noqa: E402
+import paths as _paths                                   # noqa: E402
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff'}
 
@@ -88,7 +92,7 @@ REPO = _os.environ.get('TT_REPO', 'JudgeBreddd/t-tracer')
 # rewritten on every save is a sync storm.
 SETTINGS_FILE = WORK.parent / 'settings.json'
 
-# The app's picks are a SEPARATE file from _scripts/candidates/picks.jsonl, and
+# The app's picks are a SEPARATE file from _private/candidates/picks.jsonl, and
 # that separation is the point rather than an implementation detail.
 #
 # picks.jsonl is the calibration ground truth: a reviewer at a contact sheet,
@@ -105,8 +109,9 @@ SETTINGS_FILE = WORK.parent / 'settings.json'
 APP_PICKS = WORK.parent / 'app-picks.jsonl'
 
 # Ground truth, read-only here. Absent on an installed copy (the installer
-# ships the scripts but not the corpus), which is expected, not an error.
-CALIB_PICKS = SCRIPTS / 'candidates' / 'picks.jsonl'
+# ships the engine but not the corpus), which is expected, not an error.
+# Resolved through paths.py, which owns the location of everything private.
+CALIB_PICKS = _paths.PICKS
 
 # Uploads stream to disk in fixed chunks instead of through one bytes object.
 #

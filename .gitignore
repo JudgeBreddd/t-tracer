@@ -1,64 +1,38 @@
 # ---------------------------------------------------------------------------
-# PRIVATE. None of this is ever published.
+# ONE RULE. Everything this project must never publish lives in _private/.
 #
-# The corpus is 178 real customer logos - military insignia, unit crests,
-# client artwork - and picks.jsonl records the reviewer's judgments on them. Both stay
-# on disk and out of the repo. The folder keeps everything; git tracks code.
+# This file used to be a DENYLIST - 59 rules naming ~30 scattered locations, to
+# protect a publish set of 35 files. A denylist fails OPEN: anything NEW is
+# publishable until somebody remembers to add a rule. That was not remembered
+# three times:
+#
+#   2026-09-06  _scripts/redgold/     31 customer logos   caught by hand
+#   2026-09-08  _scripts/_not-logos/  47 files, 27.7 MB   went public
+#   2026-09-08  HANDOFF.md            internal notes      went public
+#
+# Every one was a NEW name no existing rule described. A 60th rule would have
+# fixed the last incident and not the next one. One default-denied directory
+# fixes every future one, because a file created inside it is covered the
+# moment it exists and nobody has to predict its name.
+#
+# So: if it must never be published, PUT IT IN _private/. Do not add a rule
+# here. Adding rules here is what stopped working.
 # ---------------------------------------------------------------------------
-_scripts/corpus/
-_scripts/candidates/
-_scripts/candidates-*/
-_scripts/batch*/
-_scripts/one/
-_scripts/test-*/
-_scripts/new to test/
-_scripts/converter script testers/
-_scripts/completed test/
-_scripts/retest/
-_scripts/_converted/
-_scripts/ab-test/
-_scripts/triage/sheets/
-_scripts/triage/*.png
-_scripts/triage/manifest.tsv
-_scripts/triage/corpus*.txt
-_scripts/triage/dupe-clusters.tsv
-_scripts/triage/deleted-photos.txt
-_scripts/triage/mask-sweep/
-# Caught by the pre-publish audit, not by planning: 31 more customer logos.
-_scripts/redgold/
-# Caught AFTER a public push, not by the audit: the rejects pile. 47 files,
-# 27.7 MB, including a competitor's watermarked stock insignia. The bare
-# _scripts/*.png rules below match only the top level of _scripts/, so a new
-# SUBFOLDER of images was never covered. Any future one needs its own line.
-_scripts/_not-logos/
-_scripts/*.png
-_scripts/*.jpg
-_scripts/*.jpeg
-_scripts/*.svg
-stages/01_intake/output/
-stages/06_deliverables/*.svg
+_private/
 
-# Internal working notes. CLAUDE.md in particular is the decisions log - it
-# quotes the reviewer directly, names customer logos and carries business detail that
-# has no business in a public repo. README.md is the public face instead.
+# ---------------------------------------------------------------------------
+# The two exceptions, and they are exceptions for a specific reason.
+#
+# These are fixed, well-known filenames that never change - the .env case,
+# where a denylist genuinely works. CLAUDE.md must sit at the project root to
+# be auto-loaded by Claude Code and to satisfy the ICM convention, so it cannot
+# live in _private/. The directory rule exists for material whose names churn.
+# ---------------------------------------------------------------------------
 CLAUDE.md
 CONTEXT.md
-# HANDOFF*.md, not HANDOFF-*.md. The dashed form matched every dated handoff
-# and missed the undashed HANDOFF.md, which reached the public repo on
-# 2026-09-08 as a result.
-HANDOFF*.md
-# Tyler's own working list. Explicitly "a place to mark down my train of
-# thought" - internal by definition, whatever date is on the filename.
-T-Tracer_FIXES*.md
-mvp-run-notes.md
-PLANNING.md
-_archive/
-_intake/
-library/
-stages/
 
 # ---------------------------------------------------------------------------
-# Build products and caches
+# Build products and caches. Regenerated, never authored.
 # ---------------------------------------------------------------------------
 .venv/
 .venv-*/
@@ -73,33 +47,18 @@ app/T-Tracer
 app/T-Tracer.cmd
 .DS_Store
 
-# Internal working material - deliberately not published.
-# _scripts/triage/ is the corpus-building tooling: it hardcodes customer logo
-# filenames and reviewer quotes, is built around a private 600-file dump, and
-# deferred-work.md already recorded that it "does not ship".
-_scripts/triage/
-deferred-work.md
-*Punch list*.md
-
-# Dead code from the archived decompose route (stages 02-05). Referenced by
-# nothing that ships and describes a pipeline this repo no longer contains.
-_shared/scripts/
-
 # ---------------------------------------------------------------------------
-# Customer artwork. NEVER published.
-#
-# _inbox/ is Tyler's drop zone for new customer images - failures to work on,
-# jobs to test. Transient: images move out to _scripts/corpus/ if they become
-# calibration material, or are deleted once the job is done. See _inbox/README.md.
-#
-# The bare /*.png etc. rules are a SAFETY NET, not the intended path. Tyler
-# drops images in the project root by habit (twice on 2026-09-07), and a
-# customer logo reaching the public repo is the one unrecoverable mistake this
-# project can make. Belt and braces on purpose.
+# Safety net, kept deliberately. Tyler drops customer images in the project
+# root by habit (twice on 2026-09-07), and a customer logo reaching the public
+# repo is the one unrecoverable mistake this project can make. The pre-push
+# hook is the real guard now - see .githooks/pre-push - but belt and braces.
 # ---------------------------------------------------------------------------
-_inbox/
 /*.png
 /*.jpg
 /*.jpeg
 /*.webp
 /*.bmp
+
+# T-Tracer.png is the README hero image and IS published; the /*.png safety
+# net above would otherwise catch it on a re-add.
+!/T-Tracer.png

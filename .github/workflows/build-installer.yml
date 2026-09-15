@@ -65,7 +65,7 @@ jobs:
           python -m pip install --only-binary=pydantic-core --quiet `
             -r requirements.txt -r app/requirements.txt
           python -c "import sys; sys.path.insert(0,'app'); import server; print('server imports OK on Windows')"
-          python -c "import sys; sys.path.insert(0,'_scripts'); import candidates as c; print('strategies:', list(c.STRATEGIES))"
+          python -c "import sys; sys.path.insert(0,'_engine'); import candidates as c; print('strategies:', list(c.STRATEGIES))"
 
       - name: Build the installer
         shell: pwsh

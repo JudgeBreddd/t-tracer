@@ -1,0 +1,186 @@
+#!/bin/sh
+# pre-push - refuse to publish anything that is not on the allowlist.
+#
+# WHY THIS EXISTS
+# ---------------
+# .gitignore is a DENYLIST. It names what must not be published, so anything
+# NEW is public until somebody remembers to add a rule. That failed three
+# times on this repo:
+#
+#   2026-09-06  _scripts/redgold/     31 customer logos   caught by hand
+#   2026-09-08  _scripts/_not-logos/  47 files, 27.7 MB   NOT caught, went public
+#   2026-09-08  HANDOFF.md            internal notes      NOT caught, went public
+#
+# Every one was a NEW name that no existing rule described. This hook inverts
+# the default: nothing is publishable unless it is named below.
+#
+# THREE LAYERS, because each catches what the others miss:
+#
+#   1. PATH       - anything not on the allowlist is blocked.
+#                   Catches HANDOFF.md, T-Tracer_FIXES.md, _scripts/triage/*.
+#   2. IMAGE      - this repo publishes exactly 5 images and they do not change.
+#                   Any OTHER image is blocked, whatever it is called.
+#                   Catches _not-logos/, whose files were 60-400 KB - well under
+#                   any sane size cap. Checked by MAGIC BYTES, not extension,
+#                   because this project has already learned twice that the
+#                   extension lies (217 corpus files were MPO, not JPEG).
+#   3. SIZE       - anything over 2 MB is blocked. Catches .npy caches, zips,
+#                   venv artefacts, model weights.
+#
+# Deliberately NOT a CI check: CI runs after the push, and on a public repo the
+# data is exposed the moment it lands.
+#
+# Installed via core.hooksPath (see .githooks/install-hooks.sh) rather than
+# .git/hooks/, so it is tracked, survives a fresh clone, and exists on the
+# Windows desktop too.
+#
+# To override for one push, when you have genuinely decided to publish
+# something new:   TT_ALLOW_PUSH=1 git push
+# Adding the path to the allowlist below is almost always the right move
+# instead - the override leaves no record.
+
+set -u
+
+ZERO='0000000000000000000000000000000000000000'
+MAX_BYTES=2097152          # 2 MB. Largest legitimate file is T-Tracer.png at 1.5 MB.
+violations=''
+n=0
+
+if [ "${TT_ALLOW_PUSH:-}" = "1" ]; then
+    echo "pre-push: TT_ALLOW_PUSH=1 set - allowlist NOT enforced for this push." >&2
+    exit 0
+fi
+
+# --- the allowlist -----------------------------------------------------------
+# Matched on (directory, filename) so a pattern can never leak into a
+# subdirectory. "_engine/*.py" must NOT match "_engine/sub/probe.py",
+# and shell case-globbing would let it, because * matches "/" too.
+is_allowed() {
+    _dir=$1
+    _base=$2
+    case "$_dir" in
+    .)
+        case "$_base" in
+        .gitignore|LICENSE|README.md|CONTRIBUTING.md|HOW-IT-WORKS.md) return 0 ;;
+        method-index.md|VERSION|requirements.txt|T-Tracer.png)        return 0 ;;
+        esac
+        ;;
+    .github/workflows) case "$_base" in *.yml|*.yaml) return 0 ;; esac ;;
+    .githooks)         return 0 ;;
+    _github-images)    case "$_base" in *.png) return 0 ;; esac ;;
+    _engine)           case "$_base" in *.py|laser-output-rules.md) return 0 ;; esac ;;
+    app)
+        case "$_base" in
+        *.py|*.sh|*.ps1|*.iss|*.txt|.gitignore) return 0 ;;
+        esac
+        ;;
+    app/static)
+        case "$_base" in
+        *.css|*.js|*.html|*.webmanifest|icon.png|icon.ico) return 0 ;;
+        esac
+        ;;
+    esac
+    return 1
+}
+
+# The complete set of images this repo publishes. Any other image is blocked.
+is_known_image_path() {
+    case "$1" in
+    T-Tracer.png|_github-images/t-tracer_main.png|_github-images/t-tracer_history.png) return 0 ;;
+    app/static/icon.png|app/static/icon.ico) return 0 ;;
+    esac
+    return 1
+}
+
+# Magic bytes, not extension. Returns 0 if the blob is an image.
+blob_is_image() {
+    _hex=$(git cat-file blob "$1" 2>/dev/null | od -An -tx1 -N12 2>/dev/null | tr -d ' \n')
+    case "$_hex" in
+    89504e47*)     return 0 ;;   # PNG
+    ffd8ff*)       return 0 ;;   # JPEG / MPO
+    47494638*)     return 0 ;;   # GIF
+    424d*)         return 0 ;;   # BMP
+    49492a00*)     return 0 ;;   # TIFF little-endian
+    4d4d002a*)     return 0 ;;   # TIFF big-endian
+    52494646????????57454250*) return 0 ;;  # RIFF....WEBP
+    esac
+    return 1
+}
+
+seen_paths=''
+add() {
+    # One line per PATH. A file touched by several commits in the pushed range
+    # is one problem, not one per commit.
+    case "$seen_paths" in
+    *"|$2|"*) return 0 ;;
+    esac
+    seen_paths="${seen_paths}|$2|"
+    violations="${violations}  $1
+"
+    n=$((n + 1))
+}
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "$ZERO" ] && continue        # branch deletion
+
+    if [ "$remote_sha" = "$ZERO" ]; then
+        # New branch. Compare against the published default branch if we have
+        # it; otherwise every commit is new and must all be checked.
+        if git rev-parse --verify -q origin/master >/dev/null 2>&1; then
+            range="origin/master..$local_sha"
+        else
+            range="$local_sha"
+        fi
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    # List every blob this push would introduce, deduped by path+sha.
+    listing=$(git rev-list "$range" 2>/dev/null | while read -r c; do
+        git diff-tree -r --no-commit-id --diff-filter=AM "$c" 2>/dev/null \
+        | awk -F'\t' '{ split($1, a, " "); print a[4] "\t" $2 }'
+    done | sort -u)
+
+    [ -n "$listing" ] || continue
+
+    while IFS='	' read -r sha path; do
+        [ -n "${path:-}" ] || continue
+        dir=$(dirname "$path")
+        base=$(basename "$path")
+
+        if ! is_allowed "$dir" "$base"; then
+            add "$path  -- not on the allowlist" "$path"
+            continue
+        fi
+        if blob_is_image "$sha" && ! is_known_image_path "$path"; then
+            add "$path  -- is an image, and only the 5 known images may publish" "$path"
+            continue
+        fi
+        size=$(git cat-file -s "$sha" 2>/dev/null || echo 0)
+        if [ "$size" -gt "$MAX_BYTES" ]; then
+            add "$path  -- ${size} bytes, over the ${MAX_BYTES} limit" "$path"
+        fi
+    done <<EOF
+$listing
+EOF
+done
+
+if [ "$n" -gt 0 ]; then
+    cat >&2 <<EOF
+
+  PUSH BLOCKED - $n file(s) would be published that should not be.
+
+$violations
+  This repo is PUBLIC. Customer artwork, the calibration corpus, picks.jsonl
+  and the internal notes must never reach it.
+
+  If this is a real new source file, add it to the allowlist in
+  .githooks/pre-push and commit that change with it.
+
+  If you have genuinely decided to publish it:  TT_ALLOW_PUSH=1 git push
+
+EOF
+    exit 1
+fi
+
+exit 0
