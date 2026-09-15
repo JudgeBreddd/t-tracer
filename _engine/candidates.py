@@ -88,6 +88,9 @@ IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 # ---------------------------------------------------------------------------
 
 MAX_MEGAPIXELS = max(1.0, float(os.environ.get('TT_MAX_MEGAPIXELS', '200')))
+# Tyler locked 1600 on 2026-09-08 and turned it on by default 2026-09-14: it
+# produced 55/58 shippable. The app and the CLI both read this one value.
+WORK_DIM_DEFAULT = 1600
 
 
 def _align_pillow_limit():
@@ -119,7 +122,7 @@ def load_source(img_path, work_dim=0):
     the resize. Resizing first, the only full-size allocation left is the decode
     itself, and JPEG sources avoid even that.
 
-    `work_dim` 0 keeps the original size (current default, nothing changes).
+    `work_dim` 0 keeps the original size (the default is WORK_DIM_DEFAULT).
     """
     from PIL import Image
     with Image.open(img_path) as probe:
@@ -1799,12 +1802,13 @@ def count_nodes(paths):
 def run_one(img_path, out_root, args):
     import hygiene
 
-    rgb, alpha = load_source(img_path, getattr(args, 'work_dim', 0))
+    rgb, alpha = load_source(img_path, getattr(args, 'work_dim', WORK_DIM_DEFAULT))
     # Order-catalogue art runs to 134 MP. With --scale supersampling on top that
     # is billions of pixels and the run never returns. Engraved artwork is ~32mm
     # tall, so detail past a couple of thousand pixels cannot reach the plate.
-    # Every image in the original 15-image test set is <=2000px, so the 2048
-    # default is a no-op on all prior calibration.
+    # With --work-dim on (the default) the source is already 1600px here and
+    # this never fires; it only guards --work-dim 0. It is NOT a no-op on
+    # calibration at native size: 26 of 82 picked images exceed 2048px.
     if getattr(args, 'max_dim', 0) and max(rgb.shape[:2]) > args.max_dim:
         _s = args.max_dim / max(rgb.shape[:2])
         rgb = cv2.resize(rgb, (max(1, int(rgb.shape[1] * _s)), max(1, int(rgb.shape[0] * _s))),
@@ -2091,11 +2095,11 @@ def main():
                     help='allow -j above the memory-safe worker count. The '
                          'safe count exists because exceeding it OOM-kills '
                          'whatever else is running on the machine.')
-    ap.add_argument('--work-dim', type=int, default=0,
+    ap.add_argument('--work-dim', type=int, default=WORK_DIM_DEFAULT,
                     help='resize EVERY source to this long edge as the very '
                          'first step, so every stage downstream runs at one '
-                         'agreed size (0 = off, keep native). This is the '
-                         'resize that should replace the per-stage ones.')
+                         f'agreed size (default {WORK_DIM_DEFAULT}; 0 = off, '
+                         'keep native).')
     ap.add_argument('--out', default='candidates', help='output folder name')
     args = ap.parse_args()
 
