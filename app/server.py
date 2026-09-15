@@ -931,6 +931,35 @@ def stats_report():
     }
 
 
+# --------------------------------------------------------------------------
+# Item 3.5: auto-update. Shared by the reporting-only check above and the
+# actual downloader below, so a change to how "newer" is decided cannot
+# silently diverge between what the UI shows and what the updater acts on.
+# --------------------------------------------------------------------------
+
+def _version_parts(v: str) -> list[int]:
+    out = []
+    for chunk in v.split('.'):
+        digits = ''.join(c for c in chunk if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    return out
+
+
+def _fetch_latest_release() -> dict | None:
+    """The full GitHub release payload (assets included), or None on any
+    failure - offline, rate limited, no releases yet. Never raises."""
+    import urllib.request
+    url = f'https://api.github.com/repos/{REPO}/releases/latest'
+    try:
+        req = urllib.request.Request(
+            url, headers={'Accept': 'application/vnd.github+json',
+                          'User-Agent': f't-tracer/{APP_VERSION}'})
+        with urllib.request.urlopen(req, timeout=4) as r:
+            return json.loads(r.read().decode())
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 @app.get('/api/update-check')
 def update_check():
     """Ask GitHub for the newest release. Fails silently and never blocks.
@@ -939,30 +968,115 @@ def update_check():
     limited, or a repo with no releases yet all return the same quiet
     'no update' rather than an error the user has to dismiss.
     """
-    import urllib.request
-    url = f'https://api.github.com/repos/{REPO}/releases/latest'
-    try:
-        req = urllib.request.Request(
-            url, headers={'Accept': 'application/vnd.github+json',
-                          'User-Agent': f't-tracer/{APP_VERSION}'})
-        with urllib.request.urlopen(req, timeout=4) as r:
-            data = json.loads(r.read().decode())
-    except Exception:                                      # noqa: BLE001
+    data = _fetch_latest_release()
+    if data is None:
         return {'current': APP_VERSION, 'checked': False}
 
     tag = str(data.get('tag_name') or '').lstrip('vV')
-
-    def parts(v):
-        out = []
-        for chunk in v.split('.'):
-            digits = ''.join(c for c in chunk if c.isdigit())
-            out.append(int(digits) if digits else 0)
-        return out
-
-    newer = bool(tag) and parts(tag) > parts(APP_VERSION)
+    newer = bool(tag) and _version_parts(tag) > _version_parts(APP_VERSION)
     return {'current': APP_VERSION, 'checked': True, 'latest': tag or None,
             'update': newer, 'url': data.get('html_url'),
             'notes': (data.get('body') or '')[:400]}
+
+
+# --------------------------------------------------------------------------
+# The install half of item 3.5. "Do item 6 (SHA-256 verification) first - an
+# auto-updater that runs an unverified download is strictly worse than no
+# auto-updater" - so this never runs the downloaded .exe without a checksum
+# that matches, ships with build-installer.yml computing and publishing that
+# checksum as its own release asset (T-Tracer-Setup.exe.sha256).
+# --------------------------------------------------------------------------
+
+def _release_assets(data: dict) -> dict[str, str]:
+    """name -> browser_download_url for every asset on a release payload."""
+    return {a['name']: a['browser_download_url']
+            for a in (data.get('assets') or []) if a.get('name') and a.get('browser_download_url')}
+
+
+def verify_sha256(path: Path, expected: str) -> bool:
+    """True iff `path` hashes to `expected`. Accepts either a bare hex digest
+    (Get-FileHash's own format, matching app/install.ps1's PyInstallerSha256)
+    or a `sha256sum`-style 'hex  filename' line - only the first token is used."""
+    import hashlib
+    digest = hashlib.sha256()
+    with path.open('rb') as f:
+        while chunk := f.read(1 << 20):
+            digest.update(chunk)
+    token = expected.strip().split()[0] if expected.strip() else ''
+    return bool(token) and digest.hexdigest().lower() == token.lower()
+
+
+def _download(url: str, dest: Path) -> None:
+    """Stream a URL to disk. Raises on any failure - the caller decides what
+    'could not update' means; this function never swallows an error, because
+    swallowing it here is how a truncated .exe would end up looking verified."""
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': f't-tracer/{APP_VERSION}'})
+    with urllib.request.urlopen(req, timeout=120) as r, dest.open('wb') as out:
+        while chunk := r.read(UPLOAD_CHUNK):
+            out.write(chunk)
+
+
+# Read by GET /api/update-status so the frontend can surface a checksum
+# failure or a missing release asset - the one case that is NOT silent, per
+# item 3.5's own "mismatch or missing checksum => do not run, surface a clear
+# error". Never written to disk; a restart clears it, same as SESSION_TOKEN.
+UPDATE_STATE: dict = {'status': 'idle', 'detail': ''}
+
+
+def _auto_update_once() -> None:
+    """Runs once per launch, in a background thread - see serve(). Every
+    return before the download is a SILENT no-op by design (item 3.5: offline
+    / no update / declined must not be an error the user has to dismiss)."""
+    global UPDATE_STATE
+    if sys.platform != 'win32':
+        return                            # never attempt an install off Windows,
+                                           # regardless of what settings.json says
+    if not load_settings().get('auto_update'):
+        return
+    data = _fetch_latest_release()
+    if data is None:
+        return                            # offline / rate limited: silent
+    tag = str(data.get('tag_name') or '').lstrip('vV')
+    if not tag or _version_parts(tag) <= _version_parts(APP_VERSION):
+        return                            # no update available: silent
+    assets = _release_assets(data)
+    exe_name = next((n for n in assets if n.lower().endswith('.exe')), None)
+    sha_name = next((n for n in assets if n.lower().endswith('.sha256')), None)
+    if not exe_name or not sha_name:
+        UPDATE_STATE = {'status': 'error',
+                        'detail': f'Release {tag} is missing the installer or its '
+                                  'checksum file. Not downloading.'}
+        return
+    tmp = WORK.parent / 'update'
+    try:
+        tmp.mkdir(parents=True, exist_ok=True)
+        exe_path, sha_path = tmp / exe_name, tmp / sha_name
+        _download(assets[exe_name], exe_path)
+        _download(assets[sha_name], sha_path)
+        if not verify_sha256(exe_path, sha_path.read_text()):
+            exe_path.unlink(missing_ok=True)
+            UPDATE_STATE = {'status': 'error',
+                            'detail': f'{exe_name} failed its checksum check after '
+                                      'download. Not run - try again later.'}
+            return
+        import subprocess
+        subprocess.Popen([str(exe_path)], close_fds=True)
+        UPDATE_STATE = {'status': 'installing', 'detail': f'Installing {tag}…'}
+    except Exception as e:                                 # noqa: BLE001
+        UPDATE_STATE = {'status': 'error', 'detail': f'Auto-update failed: {e}'}
+        return
+    # The running app and the installer it just launched cannot both hold the
+    # install directory - item 3.5: "run it, exit the app". os._exit() rather
+    # than a normal return: uvicorn is serving on another thread and would
+    # otherwise keep the process (and this window) alive underneath the
+    # installer.
+    _os._exit(0)                                           # noqa: SLF001
+
+
+@app.get('/api/update-status')
+def update_status():
+    return UPDATE_STATE
 
 
 @app.get('/api/health')
@@ -1003,6 +1117,9 @@ def serve(host='127.0.0.1', port=8765):
     # fallback main.py itself suggests - where there is no other way to learn
     # the token the API now requires.
     print(f'T-Tracer: session token for direct API use: {SESSION_TOKEN}')
+    # Backgrounded so a slow/offline GitHub check never delays the window
+    # opening - main.py is already polling wait_for(port) for exactly that.
+    threading.Thread(target=_auto_update_once, daemon=True).start()
     uvicorn.run(app, host=host, port=port, log_level='warning')
 
 

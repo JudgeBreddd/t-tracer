@@ -900,8 +900,70 @@ async function loadSettingsTab() {
     box.innerHTML = '<p class="hempty">Could not load settings.</p>';
     return;
   }
+  // Re-fetch settings rather than trusting the module-level cache: this tab
+  // can be the first thing opened after a fresh /api/settings PUT elsewhere,
+  // and it needs 'platform' too, which loadSettings() at boot already fetched
+  // but the auto-update toggle below reads off `settings` directly.
+  try { settings = await (await apiFetch('/api/settings')).json(); } catch (_) {}
+  let updateState = { status: 'idle', detail: '' };
+  try { updateState = await (await apiFetch('/api/update-status')).json(); } catch (_) {}
+
   box.innerHTML = '';
   box.appendChild(storageGroup(storageInfo));
+  box.appendChild(autoUpdateGroup(updateState));
+}
+
+/* Item 3.5: the toggle only ever writes settings.auto_update=true/false - the
+ * actual download/verify/install runs server-side, once per launch, in the
+ * background (server.py _auto_update_once). This group just shows the
+ * result of the last attempt (update-status) and lets Windows users opt in. */
+function autoUpdateGroup(updateState) {
+  const g = document.createElement('section');
+  g.className = 'statgroup';
+  g.innerHTML = '<h2>Automatic updates</h2>';
+
+  const sub = document.createElement('p');
+  sub.className = 'sub';
+  const isWindows = settings.platform === 'win32';
+  sub.textContent = isWindows
+    ? 'When on, T-Tracer checks for a newer release at startup, downloads it, '
+      + 'verifies it against the checksum published with the release, and '
+      + 'installs it automatically - the running app closes to let the '
+      + 'installer run. Off by default. A failed or missing checksum is never '
+      + 'run; a declined or offline check is silent.'
+    : 'Available on Windows installs only - T-Tracer never downloads or runs '
+      + 'an installer on this platform.';
+  g.appendChild(sub);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'share';
+  const label = document.createElement('label');
+  label.className = 'optin';
+  const cb = document.createElement('input');
+  cb.type = 'checkbox';
+  cb.checked = !!settings.auto_update;
+  cb.disabled = !isWindows;
+  const span = document.createElement('span');
+  span.textContent = 'Automatically download and install updates';
+  label.append(cb, span);
+  cb.addEventListener('change', () => saveSettings({ auto_update: cb.checked }));
+  wrap.appendChild(label);
+
+  if (updateState && updateState.status === 'error') {
+    const err = document.createElement('p');
+    err.className = 'sub';
+    err.style.color = 'var(--accent-red-bright)';
+    err.textContent = updateState.detail;
+    wrap.appendChild(err);
+  } else if (updateState && updateState.status === 'installing') {
+    const info = document.createElement('p');
+    info.className = 'sub';
+    info.textContent = updateState.detail;
+    wrap.appendChild(info);
+  }
+
+  g.appendChild(wrap);
+  return g;
 }
 
 function storageGroup(info) {
