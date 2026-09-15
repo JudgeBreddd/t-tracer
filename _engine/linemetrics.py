@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """linemetrics.py - T-Tracer
 
+KEPT THOUGH WIRED INTO NOTHING (2026-09-14 dead-code audit): no other module
+imports this one. Keeping it is a documented decision, not an oversight - the
+two thrown-away waviness attempts below are exactly the kind of already-tested
+dead end this project has been bitten by re-discovering before (see
+`STRATEGIES` docs in candidates.py, "Continue documenting failed or retired
+tracing strategies"). Delete the record and a future session repeats attempt 1.
+
 The measurements Tyler actually looks at when he picks, which hygiene.py does
 not measure. Built BESIDE hygiene rather than inside it, so the existing score
 keeps working unchanged while these are calibrated.

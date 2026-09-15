@@ -58,8 +58,6 @@ from skimage.filters import threshold_multiotsu, threshold_sauvola
 from skimage.measure import label
 from scipy.ndimage import binary_fill_holes, distance_transform_edt
 
-from smoothing_engine import flatten_to_white
-
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 
 
