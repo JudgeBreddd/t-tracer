@@ -250,7 +250,8 @@ def cli_defaults(**over) -> Namespace:
     """
     base = dict(only=None, strategies=None, invert=False, scale=6,
                 smoothing=3.0, tol=0.6, close=2, open=0, min_area_frac=0.0004,
-                height_mm=32.0, raster_ss=2, jobs=1, bg=False, max_dim=2048)
+                height_mm=32.0, raster_ss=2, jobs=1, bg=False, max_dim=2048,
+                work_dim=C.WORK_DIM_DEFAULT)
     base.update(over)
     return Namespace(**base)
 
