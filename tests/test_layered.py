@@ -179,3 +179,33 @@ def test_progress_sink_is_silent_when_unset_and_throttled_when_set():
         assert seen == [('a', 'A')]                      # second frame inside 1/3 s dropped
     finally:
         C._PROGRESS = None
+
+
+def test_fused_extent_is_the_minority_population_not_the_whole_component():
+    """One big component whose second colour is a small minority must report a
+    SMALL fused area. Before 2026-09-15 it reported the whole component, so
+    any single-blob trace scored 1.000 no matter how little was wrong."""
+    img = np.zeros((200, 200, 3), np.uint8)
+    img[:, :] = (240, 240, 240)
+    img[40:160, 40:160] = (20, 20, 20)          # one big dark square
+    img[40:160, 40:64] = (230, 30, 30)          # 20% of it a different colour
+    ink = np.zeros((200, 200), bool)
+    ink[40:160, 40:160] = True                   # traced as ONE component
+    out = H.measure_fusions(ink, img)
+    assert out['fusions'] == 1
+    # the red strip is 1/5 of the square, so the fused extent is about 0.2
+    assert 0.1 < out['fused_area_frac'] < 0.3, out
+    # and a component with no second colour is not a fusion at all
+    plain = np.zeros((200, 200), bool); plain[40:160, 64:160] = True
+    assert H.measure_fusions(plain, img)['fusions'] == 0
+
+
+def test_fusion_penalty_is_area_led_with_a_capped_count_term():
+    """A little artwork eaten by many small fusions must cost less than a lot
+    of artwork eaten by one big one - the reverse of the old count-led form."""
+    many_small = {'fusions': 20, 'fused_area_frac': 0.02}
+    one_big = {'fusions': 1, 'fused_area_frac': 0.60}
+    pen = lambda f: min(40.0, f['fused_area_frac'] * 40 + min(5.0, f['fusions'] * 0.5))
+    assert pen(many_small) < pen(one_big)
+    assert pen(many_small) <= 5.8               # count term cannot sink it alone
+    assert pen({'fusions': 0, 'fused_area_frac': 1.0}) == 40.0

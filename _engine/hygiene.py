@@ -185,7 +185,22 @@ def measure_fusions(ink, src_rgb, min_frac=0.12, delta_e=22.0, min_comp_px=400):
         sep = float(np.linalg.norm(centers[0] - centers[1]))
         if sep > delta_e and minority > min_frac:
             fused += 1
-            fused_area += area
+            # THE FUSED EXTENT IS THE MINORITY POPULATION, NOT THE WHOLE
+            # COMPONENT. Adding `area` here said "this entire connected piece
+            # is a defect" whenever any part of it was, so every trace whose
+            # ink is ONE connected piece scored fused_area_frac = 1.000
+            # regardless of how much was actually merged - measured
+            # 2026-09-15 on a real silhouette candidate: one component held
+            # 97.5% of the ink and only 15.1% of it was the second colour,
+            # and the measure reported 1.000 where the truth was 0.154.
+            #
+            # That made the number nearly binary and driven by CONNECTIVITY
+            # rather than by defect size: a silhouette (one blob) always
+            # ~1.0, an outline strategy (many pieces) always small. Neither
+            # says how much artwork was lost. The minority cluster IS the
+            # population that was wrongly merged in, so its share of the
+            # component is the extent of the fusion.
+            fused_area += area * minority
 
     return {'fusions': int(fused), 'fused_area_frac': round(fused_area / total, 3)}
 
@@ -535,12 +550,24 @@ def _assemble(rendered, paths, nodes, comps, gaps, fuse, jag, xing, fidelity,
     p_xing = min(15.0, xing['self_intersecting_paths'] * 7.5)
     # Fusion is weighted heavily: it is the one defect that looks clean.
     #
-    # The per-fusion weight is deliberately small against a high cap. The first
-    # version used 10.0 against a cap of 30, which saturated at three fusions -
-    # so a candidate with 4 and one with 17 scored identically, and the count
-    # carried no information exactly where it mattered. Real candidates land
-    # between about 2 and 35, so the scale has to stay linear across that range.
-    p_fuse = min(40.0, fuse['fusions'] * 2.5 + fuse['fused_area_frac'] * 10)
+    # AREA-LED SINCE 2026-09-15, and only because the area is now measured
+    # honestly (see measure_fusions). The count-led form it replaces -
+    # 2.5 per fusion against an area term of 10 - was root-caused on
+    # 2026-09-14 as the reason an all-black candidate could rank first: two
+    # blobs covering 47% of the ink cost 9.7 points, while three shippable
+    # traces with sixteen small fusions all hit the 40 cap and could not be
+    # told apart. Count measures how BROKEN UP a defect is; area measures how
+    # MUCH of the artwork it ate, and the second is what Tyler rejects on.
+    #
+    # The count is kept as a small capped term rather than dropped: many
+    # separate fusions is still worse than one of the same total size, and
+    # 5 points cannot by itself sink a candidate.
+    #
+    # Known false positive, unchanged: an outline strategy (`linework`,
+    # `layerlines`) runs a stroke along the border between two colours, which
+    # is the fusion signature by construction. The honest area measure is what
+    # keeps that from saturating - the stroke is thin, so it eats little.
+    p_fuse = min(40.0, fuse['fused_area_frac'] * 40 + min(5.0, fuse['fusions'] * 0.5))
     p_nodes = 0.0
     if nodes_per_mm is not None and nodes_per_mm > 6:
         p_nodes = min(10.0, (nodes_per_mm - 6) * 1.5)
