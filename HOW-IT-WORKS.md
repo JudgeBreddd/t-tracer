@@ -77,7 +77,7 @@ returns a list of `(mask, colour)` layers instead; it is registered in
 | `bgdist` | CIELAB distance from the detected background colour. Does not require the artwork to be darker than its surroundings. Shippable on 38 of 41; with `otsu` it covers every image that had anything shippable. |
 | `kmeans` | Colour clustering in CIELAB, k=5, the border-majority cluster is background, everything else is ink. |
 | `composite` | `otsu` as the base, with `nested` (a 2-colouring of the region containment tree from a ControlNet lineart annotator) allowed to remove ink from large solid fields. The answer to "everything went black". Tyler's favourite on 9 of 41 despite the scorer's dislike. |
-| `layerlines` | **The colour split drawn as an engraving.** Same clustering as `kmeans`, k chosen per image, halos and near-twin colours folded away; then every boundary between two colours becomes a black line 0.2% of the long edge wide, and every region darker than L* 40 is filled. A bare channel the stroke would have closed keeps a one-pixel white spine, so thin detail survives a stroke wider than itself. Abstains on one-colour art. |
+| `layerlines` | **The colour split drawn as an engraving.** Same clustering as `kmeans`, k chosen per image, halos and near-twin colours folded away; then every boundary between two colours becomes a black line 0.125% of the long edge wide, and every region darker than L* 40 is filled. A bare channel the stroke would have closed keeps a one-pixel white spine, so thin detail survives a stroke wider than itself. Abstains on one-colour art. |
 
 **The sheet was trimmed from ten to five on 2026-09-15**, on 95 judged images.
 Coverage saturates at `otsu` + `bgdist`; the other three earn their place on

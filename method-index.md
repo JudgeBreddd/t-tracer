@@ -139,7 +139,7 @@ minimum fragment so detail survives) and then, instead of colour layers:
 
 7. Boundary pixels: any pixel whose right or lower neighbour has a different
    cluster label, marked on both sides
-8. Dilate the boundary by an ellipse `line_frac` × long edge (3px at 1600)
+8. Dilate the boundary by an ellipse `line_frac` × long edge (2px at 1600)
 9. **Carve the bare area's medial axis back out of the stroke, where the bare
    area is within `line_px` of ink** (`_keep_white_channels`) — so a channel
    the stroke would have closed keeps a one-pixel white spine
@@ -148,7 +148,7 @@ minimum fragment so detail survives) and then, instead of colour layers:
 
 | parameter | default |
 |---|---|
-| `line_frac` | 0.002 of the long edge (3px at 1600) |
+| `line_frac` | 0.00125 of the long edge (2px at 1600 — Tyler's pick 2026-09-15, chosen only after step 9 made every width keep its detail) |
 | `protect_white` | True — step 9 |
 | `fill_L` | 40 |
 | core radius / min core | 1 px / 4 px (detail on this path is line, not wrong colour) |

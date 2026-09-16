@@ -485,7 +485,7 @@ def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
     return out
 
 
-def strat_layerlines(rgb, line_frac=0.002, fill_L=40.0, protect_white=True,
+def strat_layerlines(rgb, line_frac=0.00125, fill_L=40.0, protect_white=True,
                      **kw):
     """Black-and-white output built ON the colour layering.
 
@@ -497,9 +497,11 @@ def strat_layerlines(rgb, line_frac=0.002, fill_L=40.0, protect_white=True,
 
       * every boundary between two different colour regions - including a
         colour against the background - becomes a black line `line_frac` of
-        the long edge wide (3px at 1600), with any white channel the stroke
-        would have closed carved back out - see `_keep_white_channels`, and
-        the note there for why no width alone could be right. This is what the hairline seams
+        the long edge wide (2px at 1600 - Tyler's pick, 2026-09-15, once the
+        channel fix below made every width keep its detail), with any white
+        channel the stroke would have closed carved back out - see
+        `_keep_white_channels`, and the note there for why no width alone
+        could be right. This is what the hairline seams
         between separately-traced colour layers turn into: one stroke that
         covers them, instead of a gap;
       * every region darker than `fill_L` (CIELAB L*) is filled black - the
