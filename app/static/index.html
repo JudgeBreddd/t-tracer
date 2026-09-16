@@ -70,9 +70,41 @@
     <input id="file" type="file" accept="image/*" multiple hidden>
   </section>
 
+  <section id="intake" class="intake" hidden>
+    <div class="intake-text">
+      <b>Calibration intake</b>
+      <span id="intake-count" class="meta"></span>
+    </div>
+    <div class="intake-actions">
+      <label class="meta" for="intake-n">How many</label>
+      <select id="intake-n">
+        <option>5</option>
+        <option selected>10</option>
+        <option>20</option>
+        <option>50</option>
+      </select>
+      <button id="intake-go" class="primary" type="button">Trace the next batch</button>
+    </div>
+  </section>
+
   <section id="progress" class="progress" hidden>
     <div class="bar"><span id="barfill"></span></div>
     <p id="progresstext" class="meta">Tracing…</p>
+  </section>
+
+  <section id="live" class="live" hidden>
+    <div class="live-head">
+      <span class="meta">Live view (debug) — one frame per step, latest only</span>
+      <span id="live-actions" class="live-actions" hidden>
+        <button id="live-save" class="primary" type="button">Save snapshots</button>
+        <button id="live-discard" class="ghost" type="button">Discard</button>
+      </span>
+    </div>
+    <div id="live-big" class="live-big" hidden>
+      <img alt="">
+      <span class="meta"><b id="live-big-name"></b> <span id="live-big-step" class="step"></span></span>
+    </div>
+    <div id="live-grid" class="live-grid"></div>
   </section>
 
   <section id="results" class="results" hidden></section>

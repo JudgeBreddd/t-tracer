@@ -23,7 +23,7 @@ import sys
 import threading
 import uuid
 from argparse import Namespace
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
@@ -162,6 +162,8 @@ DEFAULT_SETTINGS = {
     'auto_update': False,  # item 3.5. Off by default; Windows-only regardless
                             # of this value (server enforces it, not just the UI).
     'retention': 'forever', # item 7: 'forever' | '90d' | '30d'
+    'live_view': False,    # debug: show each strategy's steps while tracing
+    'live_keep': False,    # debug: retain every snapshot for save-or-trash
 }
 
 
@@ -275,13 +277,15 @@ def summarise(rows: list[dict]) -> dict:
 def cli_defaults(**over) -> Namespace:
     """Exactly the argparse defaults from candidates.py, overridable.
 
-    Kept in one place so a change to the CLI's defaults cannot silently leave
-    the app tracing with stale settings.
+    Taken FROM the CLI's own parser, not re-typed: the hand-written copy this
+    replaced had drifted (it lacked min_dim, min_island and four others and
+    only worked because run_one reads those with getattr). A default added
+    to the CLI now reaches the app the moment it exists.
     """
-    base = dict(only=None, strategies=None, invert=False, scale=6,
-                smoothing=3.0, tol=0.6, close=2, open=0, min_area_frac=0.0004,
-                height_mm=32.0, raster_ss=2, jobs=1, bg=False, max_dim=2048,
-                work_dim=C.WORK_DIM_DEFAULT)
+    base = vars(C.build_parser().parse_args([]))
+    if base.get('height_mm', 0) <= 0:              # main() does the same
+        base['height_mm'] = None
+    base['jobs'] = 1
     base.update(over)
     return Namespace(**base)
 
@@ -359,10 +363,13 @@ def load_jobs() -> None:
         JOBS[job['id']] = job
 
 
-def _trace_one(img_path: str, out_root: str) -> dict:
-    """Worker body. Top level so ProcessPoolExecutor can pickle it."""
+def _trace_one(img_path: str, out_root: str, on_step=None) -> dict:
+    """Worker body. Top level so ProcessPoolExecutor can pickle it. `on_step`
+    is only ever passed on the in-process path - a callback cannot cross a
+    process boundary, so the multi-worker path traces without a live view."""
     import candidates as _C
-    return _C.run_one(Path(img_path), Path(out_root), cli_defaults())
+    args = cli_defaults(on_step=on_step) if on_step else cli_defaults()
+    return _C.run_one(Path(img_path), Path(out_root), args)
 
 
 def _run_job(job_id: str) -> None:
@@ -392,22 +399,30 @@ def _run_job_inner(job_id: str) -> None:
                                      initializer=C._worker_init) as ex:
                 futs = {ex.submit(_trace_one, str(p), str(out_dir)): p
                         for p in images}
-                for f in futs:
-                    pass
-                for f in list(futs):
+                # Completion order, not submission order: `done` used to be
+                # gated on whichever image was submitted FIRST finishing.
+                for f in as_completed(futs):
+                    err = None
                     try:
                         f.result()
                     except Exception as e:
-                        job['errors'].append(f'{futs[f].name}: {e}')
+                        err = f'{futs[f].name}: {e}'
                     with LOCK:
+                        if err:
+                            job['errors'].append(err)
                         job['done'] += 1
         else:
+            live = LIVE.get(job_id)
             for p in images:
+                err = None
                 try:
-                    _trace_one(str(p), str(out_dir))
+                    _trace_one(str(p), str(out_dir),
+                               on_step=live.observer(p.stem) if live else None)
                 except Exception as e:
-                    job['errors'].append(f'{p.name}: {e}')
+                    err = f'{p.name}: {e}'
                 with LOCK:
+                    if err:
+                        job['errors'].append(err)
                     job['done'] += 1
         job['status'] = 'ready'
     except Exception as e:                                # noqa: BLE001
@@ -513,16 +528,287 @@ async def create_job(files: list[UploadFile]):
                           + ', '.join(failed))
         raise HTTPException(400, 'No usable images. ' + '; '.join(detail))
 
+    return _start_job(job_id, src, out, accepted, rejected, oversized, failed)
+
+
+def _start_job(job_id, src, out, accepted, rejected=(), oversized=(), failed=()):
+    """Register a job whose source images are already on disk and trace it.
+    Shared by the upload route and the calibration intake route so both
+    produce an identical job record."""
     from datetime import datetime
     JOBS[job_id] = {'id': job_id, 'status': 'queued', 'done': 0,
                     'total': len(accepted), 'src_dir': str(src),
-                    'out_dir': str(out), 'errors': [], 'rejected': rejected,
+                    'out_dir': str(out), 'errors': [], 'rejected': list(rejected),
                     'created': datetime.now().isoformat(timespec='seconds'),
-                    'names': accepted, 'oversized': oversized, 'failed': failed}
+                    'names': accepted, 'oversized': list(oversized),
+                    'failed': list(failed)}
     save_job(JOBS[job_id])
+    st = load_settings()
+    if st.get('live_view'):
+        LIVE[job_id] = LiveView(keep=bool(st.get('live_keep')))
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
-    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected,
-            'oversized': oversized, 'failed': failed}
+    return {'job_id': job_id, 'accepted': accepted, 'rejected': list(rejected),
+            'oversized': list(oversized), 'failed': list(failed)}
+
+
+# --------------------------------------------------------------------------
+# Calibration intake.
+#
+# `_private/new to test/` is a queue of artwork waiting to be judged, and the
+# reason it needs code rather than a drag-and-drop is that NOTHING TRACKED
+# WHAT HAD ALREADY BEEN RUN. Measured 2026-09-15: 282 images, 111 of them
+# already judged, 41 duplicate stems - so pointing a batch at the folder
+# re-traced the same judged images over and over and produced no new
+# calibration data. Tyler, in those words: "he kept running the same 50 over
+# and over."
+#
+# So the queue is derived, never stored: an image is DONE when its stem
+# appears in either picks file, and IN FLIGHT when it is already the source
+# of a job in the work directory. Nothing to keep in sync, nothing to reset,
+# and a judgement made in the app removes it from the queue by itself.
+# --------------------------------------------------------------------------
+
+def _judged_stems() -> set[str]:
+    """Stems that already carry a verdict, from the calibration log and the
+    app's own. A row with pick None counts: 'nothing here is shippable' is a
+    judgement, and re-serving that image would ask the same question twice."""
+    out = set()
+    for f in (_paths.PICKS, APP_PICKS):
+        for row in read_jsonl(f):
+            image = row.get('image')
+            if image:
+                out.add(Path(image).stem)
+    return out
+
+
+def _in_flight_stems() -> set[str]:
+    """Stems already traced into a job and waiting on a verdict, so a second
+    'trace the next ten' does not hand back the ten now on screen."""
+    out = set()
+    for job in JOBS.values():
+        try:
+            src = Path(job.get('src_dir', ''))
+            if src.is_dir():
+                out.update(p.stem for p in src.iterdir() if p.is_file())
+        except OSError:
+            continue
+    return out
+
+
+def _intake_pool() -> tuple[list[Path], dict]:
+    """Unjudged intake images, one per stem, oldest-name-first for a stable
+    order. Returns (files, counts)."""
+    folder = _paths.INTAKE
+    counts = {'total': 0, 'judged': 0, 'in_flight': 0, 'remaining': 0,
+              'folder': str(folder), 'exists': folder.is_dir()}
+    if not folder.is_dir():
+        return [], counts
+    try:
+        files = sorted((p for p in folder.iterdir()
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTS),
+                       key=lambda p: p.name.lower())
+    except OSError:
+        return [], counts
+    judged, flight = _judged_stems(), _in_flight_stems()
+    pool, seen = [], set()
+    for p in files:
+        counts['total'] += 1
+        if p.stem in judged:
+            counts['judged'] += 1
+            continue
+        if p.stem in flight:
+            counts['in_flight'] += 1
+            continue
+        if p.stem in seen:            # same artwork twice under two extensions
+            continue
+        seen.add(p.stem)
+        pool.append(p)
+    counts['remaining'] = len(pool)
+    return pool, counts
+
+
+@app.get('/api/intake')
+def intake_status():
+    _, counts = _intake_pool()
+    return counts
+
+
+class IntakeReq(BaseModel):
+    count: int = 10
+
+
+@app.post('/api/intake/next')
+def intake_next(req: IntakeReq):
+    """Copy the next N unjudged intake images into a fresh job and trace it.
+
+    The files are COPIED, never moved: the intake folder is the only place
+    some of this artwork exists, and a job's work directory is disposable
+    history that the retention setting is allowed to delete.
+    """
+    n = max(1, min(50, int(req.count)))
+    pool, counts = _intake_pool()
+    if not counts['exists']:
+        raise HTTPException(404, f"No intake folder at {counts['folder']}")
+    if not pool:
+        raise HTTPException(400, 'Nothing left to judge: every intake image is '
+                                 'already judged or already in a job.')
+    job_id = uuid.uuid4().hex[:12]
+    src, out = WORK / job_id / 'in', WORK / job_id / 'out'
+    accepted, failed = [], []
+    try:
+        src.mkdir(parents=True, exist_ok=True)
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(507, f'could not create the job folder: {e}')
+    for p in pool[:n]:
+        try:
+            shutil.copy2(p, src / p.name)
+            accepted.append(p.name)
+        except OSError:
+            failed.append(p.name)
+    if not accepted:
+        shutil.rmtree(WORK / job_id, ignore_errors=True)
+        raise HTTPException(507, 'Could not copy any intake image - check disk space.')
+    res = _start_job(job_id, src, out, accepted, failed=failed)
+    res['remaining'] = counts['remaining'] - len(accepted)
+    return res
+
+
+# --------------------------------------------------------------------------
+# Live view (debug, off by default): watch each strategy's steps while a job
+# traces. Decided 2026-09-14, see _intake/kmeans-layered-emission-sketch.md.
+#
+#   * SEND-LATEST, NO QUEUE. The engine's per-step callback stores a bare
+#     reference to the step's array under (strategy, step) - a dict write,
+#     nothing encoded, nothing blocked. A newer frame for the same step
+#     replaces the older one. If the browser is slow it sees fewer frames;
+#     the tracer never waits on the display.
+#   * The browser polls at ~3/s and the ENCODE happens here, at poll time,
+#     downscaled to LIVE_PX on the long edge - so the cost of showing a frame
+#     is paid by the request, never by the pipeline, and only for frames
+#     that changed since the last poll (seq numbers).
+#   * Nothing is written to disk unless `keep` is on AND the user chooses
+#     Save afterwards; then the retained frames land in the job's own work
+#     folder (never the synced project tree). Retained frames are held in
+#     memory at LIVE_PX, so keeping is cheap and discard is free.
+#   * In-process path only: a callback cannot cross the ProcessPoolExecutor
+#     boundary, so a multi-image batch on a multi-worker machine has no live
+#     view. The daily case - one image at a time - is the in-process path.
+# --------------------------------------------------------------------------
+LIVE_PX = 480
+LIVE: dict[str, 'LiveView'] = {}
+
+
+def _live_encode(image) -> bytes:
+    """Any step output -> small PNG bytes. bool mask, HxWx3 RGB, or a list of
+    (mask, rgb) layers as the engine's layered strategies emit them."""
+    import numpy as np
+    import cv2
+    if isinstance(image, list):
+        if not image:
+            return b''
+        h, w = image[0][0].shape[:2]
+        out = np.full((h, w, 3), 255, np.uint8)
+        for m, color in image:
+            out[m] = color
+        image = out
+    arr = np.asarray(image)
+    if arr.dtype == bool:
+        arr = (~arr * 255).astype(np.uint8)
+    elif arr.ndim == 3:
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    h, w = arr.shape[:2]
+    s = LIVE_PX / max(h, w)
+    if s < 1.0:
+        arr = cv2.resize(arr, (max(1, int(w * s)), max(1, int(h * s))),
+                         interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode('.png', arr)
+    return buf.tobytes() if ok else b''
+
+
+class LiveView:
+    def __init__(self, keep: bool = False):
+        self.keep = keep
+        self.seq = 0
+        self.latest: dict[tuple, tuple] = {}     # (stem, strategy, step) -> (seq, image)
+        self.encoded: dict[tuple, tuple] = {}    # (stem, strategy, step) -> (seq, png)
+        self.retained: list[tuple] = []          # (stem, strategy, step, seq, png)
+        self.lock = threading.Lock()
+
+    def observer(self, stem: str):
+        def on_step(strategy, step, image):
+            with self.lock:
+                self.seq += 1
+                self.latest[(stem, strategy, step)] = (self.seq, image)
+                if self.keep:
+                    # Encode now, small: the array will be replaced or freed
+                    # by the pipeline; the retained copy is the ~50 KB PNG.
+                    self.retained.append((stem, strategy, step, self.seq,
+                                          _live_encode(image)))
+        return on_step
+
+    def frames(self, since: int = 0) -> list[dict]:
+        """Frames newer than `since` (a seq the client already has), encoded
+        on demand. Sending only what changed keeps a 3/s poll to one or two
+        small PNGs instead of every step of every strategy each time."""
+        import base64
+        with self.lock:
+            items = [(k, v) for k, v in self.latest.items() if v[0] > since]
+        out = []
+        for key, (seq, image) in items:
+            enc = self.encoded.get(key)
+            if enc is None or enc[0] != seq:
+                enc = (seq, _live_encode(image))
+                self.encoded[key] = enc
+            stem, strategy, step = key
+            out.append({'stem': stem, 'strategy': strategy, 'step': step,
+                        'seq': seq,
+                        'png': base64.b64encode(enc[1]).decode('ascii')})
+        out.sort(key=lambda f: f['seq'])
+        return out
+
+
+@app.get('/api/jobs/{job_id}/live')
+def job_live(job_id: str, since: int = 0):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, 'unknown job')
+    live = LIVE.get(job_id)
+    if live is None:
+        return {'enabled': False, 'frames': [], 'retained': 0, 'keep': False}
+    return {'enabled': True, 'frames': live.frames(since), 'keep': live.keep,
+            'seq': live.seq,
+            'retained': len(live.retained),
+            'status': job.get('status', 'unknown')}
+
+
+@app.post('/api/jobs/{job_id}/live/save')
+def job_live_save(job_id: str):
+    """Write the retained snapshots into the job's own work folder as PNGs
+    and release them from memory. The one place a live frame ever touches
+    disk, and only on this explicit request."""
+    job = JOBS.get(job_id)
+    live = LIVE.get(job_id)
+    if not job or live is None:
+        raise HTTPException(404, 'no live view for that job')
+    out = Path(job['out_dir']) / '_live'
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for stem, strategy, step, seq, png in live.retained:
+            if png:
+                (out / f'{stem}--{seq:04d}--{strategy}--{step}.png').write_bytes(png)
+                n += 1
+    except OSError as e:
+        raise HTTPException(507, f'could not write snapshots: {e}')
+    LIVE.pop(job_id, None)
+    return {'saved': n, 'dir': str(out)}
+
+
+@app.post('/api/jobs/{job_id}/live/discard')
+def job_live_discard(job_id: str):
+    LIVE.pop(job_id, None)
+    return {'ok': True}
 
 
 @app.get('/api/jobs/{job_id}')
@@ -820,6 +1106,8 @@ class Settings(BaseModel):
     role: str | None = None
     auto_update: bool | None = None
     retention: str | None = None
+    live_view: bool | None = None
+    live_keep: bool | None = None
 
 
 @app.get('/api/settings')

@@ -192,6 +192,28 @@ button:focus-visible, .dropzone:focus-visible{
   transition:width .3s ease;
 }
 
+/* ---------- calibration intake ---------- */
+.intake{display:flex; justify-content:space-between; align-items:center; gap:var(--s4);
+  flex-wrap:wrap; padding:var(--s3) var(--s4); border:1px solid var(--surface-3); border-radius:8px}
+.intake-text{display:flex; flex-direction:column; gap:2px; min-width:0}
+.intake-actions{display:flex; align-items:center; gap:var(--s2); flex-wrap:wrap}
+.intake-actions select{padding:4px 6px; border-radius:6px; border:1px solid var(--surface-3);
+  background:var(--surface-2); color:var(--text-primary)}
+
+/* ---------- live view (debug) ---------- */
+.live{display:flex; flex-direction:column; gap:var(--s3)}
+.live-head{display:flex; justify-content:space-between; align-items:center; gap:var(--s3); flex-wrap:wrap}
+.live-actions{display:flex; gap:var(--s2)}
+.live-big{display:flex; flex-direction:column; align-items:center; gap:var(--s2)}
+.live-big img{max-width:100%; max-height:min(60vh, 520px); background:#fff; border:1px solid var(--surface-3); border-radius:6px}
+.live-big .meta{font-size:12px}
+.live-big .step{color:var(--text-muted)}
+.live-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:var(--s3)}
+.live-tile{display:flex; flex-direction:column; gap:var(--s1); min-width:0}
+.live-tile img{width:100%; aspect-ratio:1; object-fit:contain; background:#fff; border:1px solid var(--surface-3); border-radius:4px}
+.live-tile .meta{font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.live-tile .step{color:var(--text-muted)}
+
 /* ---------- results ---------- */
 .results{display:flex; flex-direction:column; gap:var(--s5)}
 /* best_DESIGN.md 3.2: cards are separated by surface contrast, a hairline

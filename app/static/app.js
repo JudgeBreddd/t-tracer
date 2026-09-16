@@ -44,7 +44,7 @@ const state = { jobId: null, images: [], sel: {}, fav: {}, failed: {},
  * ORIGIN, and http://127.0.0.1:41337 is a different origin from
  * http://127.0.0.1:39112. Every start was a fresh, empty store. A settings
  * file next to the work directory does not care which port the app got. */
-let settings = { dest: '', share_stats: false, role: 'user' };
+let settings = { dest: '', share_stats: false, role: 'user', live_view: false, live_keep: false };
 
 async function loadSettings() {
   try {
@@ -125,6 +125,7 @@ async function upload(fileList) {
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const j = await r.json();
     state.jobId = j.job_id;
+    if (settings.live_view) liveStart(j.job_id);
     if (j.rejected?.length) toast(`Skipped ${j.rejected.length} non-image file(s).`, true);
     if (j.oversized?.length) toast(`Skipped ${j.oversized.length} file(s) over the upload size limit.`, true);
     // Distinct from "oversized" - a write failure (e.g. the disk is full) is
@@ -156,6 +157,154 @@ async function poll(jobId) {
   setTimeout(() => { $('#progress').hidden = true; }, 900);
   loadResults(jobId);
 }
+
+/* ---------------- calibration intake ----------------
+ * `_private/new to test/` is a queue of artwork waiting for a verdict. The
+ * server derives what is left (judged stems are out, stems already in a job
+ * are out), so this panel only has to show the number and ask for a batch.
+ * Hidden entirely when there is no intake folder - a customer install has
+ * none, and an empty control is worse than no control. */
+async function loadIntake() {
+  let j;
+  try {
+    j = await (await apiFetch('/api/intake')).json();
+  } catch (_) { return; }
+  const box = $('#intake');
+  if (!j.exists || (!j.remaining && !j.in_flight)) { box.hidden = true; return; }
+  box.hidden = false;
+  $('#intake-count').textContent = j.remaining
+    ? `${j.remaining} still to judge, ${j.judged} done of ${j.total}`
+    : `Nothing left to judge - ${j.in_flight} waiting on a verdict`;
+  $('#intake-go').disabled = !j.remaining;
+}
+
+$('#intake-go').addEventListener('click', async () => {
+  const btn = $('#intake-go');
+  btn.disabled = true;
+  $('#progress').hidden = false;
+  $('#barfill').style.width = '2%';
+  $('#progresstext').textContent = 'Loading the next batch…';
+  try {
+    const r = await apiFetch('/api/intake/next', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count: Number($('#intake-n').value) }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    state.jobId = j.job_id;
+    if (settings.live_view) liveStart(j.job_id);
+    if (j.failed?.length) toast(`Could not read ${j.failed.length} file(s).`, true);
+    poll(j.job_id);
+  } catch (err) {
+    $('#progress').hidden = true;
+    toast(String(err.message || err), true);
+  }
+  loadIntake();
+});
+
+/* ---------------- live view (debug, off by default) ----------------
+ * Polls /api/jobs/{id}/live at ~3/s while the job traces. The server holds
+ * ONE frame per (image, strategy, step) - the latest - and encodes on
+ * request, so a slow browser just sees fewer frames and the tracer never
+ * waits on it. Each tile is one strategy; its image is that strategy's most
+ * recent step. Frames that did not change (same seq) are not re-decoded. */
+const live = { jobId: null, seen: new Map(), frames: new Map(), since: 0, timer: null };
+
+function liveStart(jobId) {
+  live.jobId = jobId;
+  live.seen.clear();
+  live.frames.clear();
+  live.since = 0;
+  $('#live-grid').innerHTML = '';
+  $('#live-big').hidden = true;
+  $('#live-actions').hidden = true;
+  $('#live').hidden = false;
+  livePoll();
+}
+
+async function livePoll() {
+  if (!live.jobId) return;
+  let j;
+  try {
+    j = await (await apiFetch(`/api/jobs/${live.jobId}/live?since=${live.since}`)).json();
+  } catch (_) { return; }
+  if (!j.enabled) { $('#live').hidden = true; live.jobId = null; return; }
+  // The server sends only frames newer than `since`; merge into what we hold.
+  for (const f of j.frames) live.frames.set(`${f.stem}|${f.strategy}|${f.step}`, f);
+  live.since = j.seq || live.since;
+  j.frames = [...live.frames.values()];
+  // One BIG tile: the strategy currently running, showing its newest frame
+  // as it changes (about 3/s). When a strategy reaches 'scored' it drops
+  // into the small grid and waits; the next one takes the big slot.
+  const grid = $('#live-grid');
+  const big = $('#live-big');
+  const done = new Set(j.frames.filter((f) => f.step === 'scored').map((f) => `${f.stem}|${f.strategy}`));
+  let current = null;
+  for (const f of j.frames) {
+    const key = `${f.stem}|${f.strategy}`;
+    if (done.has(key)) {
+      let tile = grid.querySelector(`[data-key="${CSS.escape(key)}"]`);
+      if (!tile) {
+        tile = document.createElement('div');
+        tile.className = 'live-tile';
+        tile.dataset.key = key;
+        tile.innerHTML = `<img alt=""><span class="meta"><b></b> <span class="step"></span></span>`;
+        tile.querySelector('b').textContent = f.strategy;
+        grid.appendChild(tile);
+      }
+      if (f.step !== 'scored' || live.seen.get(key) === f.seq) continue;
+      live.seen.set(key, f.seq);
+      tile.querySelector('img').src = `data:image/png;base64,${f.png}`;
+      tile.querySelector('.step').textContent = 'done';
+    } else if (!current || f.seq > current.seq) {
+      current = f;
+    }
+  }
+  if (current) {
+    const key = `big|${current.stem}|${current.strategy}`;
+    big.hidden = false;
+    if (live.seen.get(key) !== current.seq) {
+      live.seen.set(key, current.seq);
+      big.querySelector('img').src = `data:image/png;base64,${current.png}`;
+      $('#live-big-name').textContent = current.strategy;
+      $('#live-big-step').textContent = current.step;
+    }
+  } else {
+    big.hidden = true;
+  }
+  const running = j.status === 'tracing' || j.status === 'queued';
+  if (running) {
+    live.timer = setTimeout(livePoll, 333);
+    return;
+  }
+  // Done. Retained frames are the user's call: save or trash, never automatic.
+  if (j.keep && j.retained > 0) {
+    $('#live-actions').hidden = false;
+  } else {
+    await apiFetch(`/api/jobs/${live.jobId}/live/discard`, { method: 'POST' }).catch(() => {});
+    setTimeout(() => { $('#live').hidden = true; }, 1500);
+    live.jobId = null;
+  }
+}
+
+$('#live-save').addEventListener('click', async () => {
+  if (!live.jobId) return;
+  try {
+    const r = await apiFetch(`/api/jobs/${live.jobId}/live/save`, { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    toast(`Saved ${j.saved} snapshot${j.saved === 1 ? '' : 's'} to ${j.dir}`);
+  } catch (err) { toast(String(err.message || err), true); }
+  $('#live').hidden = true;
+  live.jobId = null;
+});
+$('#live-discard').addEventListener('click', async () => {
+  if (!live.jobId) return;
+  await apiFetch(`/api/jobs/${live.jobId}/live/discard`, { method: 'POST' }).catch(() => {});
+  $('#live').hidden = true;
+  live.jobId = null;
+});
 
 /* ---------------- results ---------------- */
 async function loadResults(jobId) {
@@ -624,6 +773,9 @@ async function recordJudgement(imgs) {
       });
     } catch (_) { /* never let bookkeeping break the actual work */ }
   }
+  // A verdict is what takes an image out of the calibration queue, so the
+  // count is only ever right if it is re-read here.
+  loadIntake();
 }
 
 
@@ -911,6 +1063,40 @@ async function loadSettingsTab() {
   box.innerHTML = '';
   box.appendChild(storageGroup(storageInfo));
   box.appendChild(autoUpdateGroup(updateState));
+  box.appendChild(liveViewGroup());
+}
+
+/* Live view: a diagnostic, not a customer feature. Both switches only write
+ * settings; the server decides per job at creation time whether to attach
+ * an observer, so flipping them mid-trace changes the NEXT job, not this one. */
+function liveViewGroup() {
+  const g = document.createElement('section');
+  g.className = 'statgroup';
+  g.innerHTML = `<h2>Live view (debug)</h2>
+    <p class="sub">Show each strategy's steps while a job traces - about three
+      frames a second, latest frame only, nothing queued. Off by default. If a
+      step already looks wrong mid-run, that is the step that introduced it.
+      Single-image jobs only.</p>`;
+  const wrap = document.createElement('div');
+  wrap.className = 'share';
+  const mk = (key, text) => {
+    const label = document.createElement('label');
+    label.className = 'optin';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!settings[key];
+    const span = document.createElement('span');
+    span.textContent = text;
+    label.append(cb, span);
+    cb.addEventListener('change', () => saveSettings({ [key]: cb.checked }));
+    return label;
+  };
+  wrap.appendChild(mk('live_view', 'Show the live view while tracing'));
+  wrap.appendChild(mk('live_keep',
+    'Keep every snapshot until the job ends, then ask whether to save them '
+    + '(into the job\'s own history folder) or discard them'));
+  g.appendChild(wrap);
+  return g;
 }
 
 /* Item 3.5: the toggle only ever writes settings.auto_update=true/false - the
@@ -1067,6 +1253,7 @@ async function checkUpdate() {
 /* ---------------- boot ---------------- */
 loadSettings();
 checkUpdate();
+loadIntake();
 
 
 /* ---------------- full-size candidate viewer ----------------

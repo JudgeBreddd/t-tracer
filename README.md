@@ -65,17 +65,17 @@ interface shows you pictures instead of a number.
 |---|---|
 | `otsu` | Global luminance threshold. The baseline, and still the most reliable single strategy. |
 | `bgdist` | CIELAB distance from the detected background. Does not require the artwork to be darker than its surroundings. |
-| `kmeans` | Colour clustering. |
-| `linework` | Decides by stroke *thickness* rather than colour — a thin region is a line, a thick one is a field. |
-| `silhouette` | Everything that is not background, thresholded **inside the artwork only**. Wins on saturated mid-tones that global thresholds drop. |
-| `nested` | Ink as a 2-colouring of the containment tree: a region flips relative to the region that contains it. Uses a ControlNet lineart annotator for boundaries. |
-| `composite` | `otsu` as the base, with `nested` allowed to punch holes in large solid fields. Answers the "everything went black" failure. |
+| `kmeans` | Colour clustering in CIELAB; the cluster that owns the border is background. |
+| `composite` | `otsu` as the base, with a region-containment pass allowed to punch holes in large solid fields. Answers the "everything went black" failure. |
+| `layerlines` | The colour split drawn as an engraving: every boundary between two colours becomes a black line, dark regions are filled. Built for multi-colour insignia; abstains on one-colour art. |
 
-`--strategies` also reaches `plate`, `neural`, `edges`, `sauvola`, `inotsu` and
-`triotsu`, all of which lost their place on the default sheet by failing to win
-picks. `triotsu` in particular is kept, with its failure documented in the
-source, so nobody spends an afternoon rediscovering that three-class Otsu turns
-a gold shield into a black blob.
+Five, down from ten in September 2026, on the evidence of 95 judged images: two
+strategies cover everything that was ever shippable and the other three are the
+ones the reviewer actually starred. `--strategies` still reaches the rest —
+`silhouette`, `keyline`, `keyfill`, `keyflip`, `linework`, `nested`,
+`kmeans-layered` (one `<path>` per colour, for recolouring), `plate`, `neural`,
+`edges`, `sauvola`, `inotsu`, `triotsu` — each kept with its failure documented
+in the source so nobody rediscovers it.
 
 ### Deeper
 

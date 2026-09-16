@@ -4,7 +4,7 @@ One entry per strategy: the ordered steps it runs, and every parameter that
 touches its result. Built to drive the parameter sweep, not to explain the code
 — for *why* a method exists, read its docstring in `_engine/candidates.py`.
 
-**Complete:** 10 default + 6 optional + 3 archived. Written 2026-09-08.
+**Complete:** 5 default + 13 optional + 3 archived. Written 2026-09-08; `kmeans-layered` and `layerlines` added and the sheet trimmed to five 2026-09-15 (evidence in the `OPTIONAL` comment in `candidates.py`).
 
 ---
 
@@ -131,6 +131,67 @@ colour.
 | `k` | 5 |
 | attempts / iters / eps | 4 / 30 / 0.5 (hardcoded) |
 | border band `b` | ≤4 px (hardcoded) |
+
+## layerlines — 0 picks (new 2026-09-15, ON the sheet)
+
+`kmeans-layered`'s clustering (below, steps 1-6, with a 1px core and a 4px
+minimum fragment so detail survives) and then, instead of colour layers:
+
+7. Boundary pixels: any pixel whose right or lower neighbour has a different
+   cluster label, marked on both sides
+8. Dilate the boundary by an ellipse `line_frac` × long edge (2px at 1600)
+9. **Carve the bare area's medial axis back out of the stroke, where the bare
+   area is within `line_px` of ink** (`_keep_white_channels`) — so a channel
+   the stroke would have closed keeps a one-pixel white spine
+10. OR in every layer whose centre colour is darker than `fill_L` (CIELAB L*)
+11. Boolean mask → the shared `clean_mask` → `mask_to_paths` → `hygiene.score`
+
+| parameter | default |
+|---|---|
+| `line_frac` | 0.00125 of the long edge (2px at 1600 — Tyler's pick 2026-09-15, chosen only after step 9 made every width keep its detail) |
+| `protect_white` | True — step 9 |
+| `fill_L` | 40 |
+| core radius / min core | 1 px / 4 px (detail on this path is line, not wrong colour) |
+
+Step 9 exists because Tyler rejected every width. Shown 4, 6 and 8px: *"none
+— left closest but no"*. The defect was never the width: a stroke `line_px`
+wide swallows every bare gap narrower than itself, and a thinner stroke only
+moves which detail dies. The LCS Squadron One lighthouse railing has ~3px
+gaps at the 1600px working size and was solid black at every width; with
+step 9 it survives. Restricting the carve to narrow places is what keeps it
+from punching holes in legitimate boundary lines — in open space the medial
+axis is far from any ink and the stroke never reaches it.
+
+## kmeans-layered — 0 picks (new 2026-09-15, OPTIONAL: the colour version)
+
+The only strategy that returns LAYERS (`list[(mask, rgb)]`) rather than one
+mask; registered in `LAYERED` and emitted by `_emit_layered`. Steps 1-2 as
+`kmeans`, then:
+
+1. RGB → Lab, flatten to Nx3
+2. k chosen per image: `_pick_k` runs seeded k-means for k=2.. on a 20k-pixel
+   sample and stops at the first k whose extra cluster cuts within-cluster
+   scatter by under 12% (`min_gain`)
+3. K-means at that k, seed 0, 4 attempts; border-majority cluster = background
+4. Fold, in real CIELAB units (`_true_lab` - OpenCV's packed Lab weights L 2.55x):
+   clusters under `min_frac` of the artwork → nearest centre; clusters that are
+   thin (mean thickness < `halo_px`) AND lie between two other centres
+   (`_between`) → the nearer endpoint; centres within `merge_de` → the larger
+5. Boundary clean-up: each cluster keeps only its eroded core (radius 0.1% of
+   the long edge, fragments under (0.4% long edge)² dropped); every other pixel
+   goes to the nearest core (`distance_transform_edt`)
+6. Layers ordered lightest → darkest (darkest drawn last); abstains with fewer
+   than two non-background layers
+7. Per layer: `clean_mask` → `mask_to_paths` (shared, unchanged) →
+   `paths_to_svg_layered` (one `<path>` per layer) → `hygiene.score_layered`
+
+| parameter | default |
+|---|---|
+| `k` | 0 = choose per image (`_pick_k`, `k_max` 8, `min_gain` 0.12) |
+| `min_frac` | 0.015 of artwork area |
+| `halo_px` | 3.0 (mean local thickness, work px) |
+| `merge_de` | 15.0 (real CIELAB) |
+| core radius / min core | 0.1% long edge / (0.4% long edge)² (hardcoded) |
 
 ## bgdist — 5 picks
 

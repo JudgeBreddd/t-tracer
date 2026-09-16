@@ -67,21 +67,26 @@ is under 2000 px, so the cap is a no-op on all prior calibration data.
 ### 2.2 The strategies
 
 Each is a pure function from RGB to a boolean mask. Adding one means adding a
-function and a dictionary entry.
+function and a dictionary entry. The one exception is `kmeans-layered`, which
+returns a list of `(mask, colour)` layers instead; it is registered in
+`LAYERED` and goes through the layered emission path described in 2.5.
 
 | Strategy | Mechanism |
 |---|---|
-| `otsu` | Global luminance threshold. The baseline, and still the most reliable single strategy — shippable in 24 of 26 judged images. |
-| `bgdist` | CIELAB distance from the detected background colour. Does not require the artwork to be darker than its surroundings. Quietly excellent: also 24 of 26. |
-| `kmeans` | Colour clustering, k=5, darker clusters become ink. |
-| `linework` | Decides by **stroke thickness, not colour**. A thin region already *is* a line, so fill it; a thick region is a field, so outline it. Built for crests where a gold outline must become a black outline. |
-| `silhouette` | Everything that is not background, thresholded **inside the artwork only**. |
-| `nested` | Ink as a 2-colouring of the region containment tree. |
-| `composite` | `otsu` as the base, with `nested` allowed to remove ink from large solid fields. |
+| `otsu` | Global luminance threshold. The baseline, and still the most reliable single strategy — shippable on 39 of 41 judged images. |
+| `bgdist` | CIELAB distance from the detected background colour. Does not require the artwork to be darker than its surroundings. Shippable on 38 of 41; with `otsu` it covers every image that had anything shippable. |
+| `kmeans` | Colour clustering in CIELAB, k=5, the border-majority cluster is background, everything else is ink. |
+| `composite` | `otsu` as the base, with `nested` (a 2-colouring of the region containment tree from a ControlNet lineart annotator) allowed to remove ink from large solid fields. The answer to "everything went black". Tyler's favourite on 9 of 41 despite the scorer's dislike. |
+| `layerlines` | **The colour split drawn as an engraving.** Same clustering as `kmeans`, k chosen per image, halos and near-twin colours folded away; then every boundary between two colours becomes a black line 0.125% of the long edge wide, and every region darker than L* 40 is filled. A bare channel the stroke would have closed keeps a one-pixel white spine, so thin detail survives a stroke wider than itself. Abstains on one-colour art. |
 
-Reachable via `--strategies` but off the default sheet: `plate`, `neural`,
-`edges`, `sauvola`, `inotsu`, `triotsu`. Each lost its place by failing to win
-picks over real artwork, and the reasons are recorded in the source.
+**The sheet was trimmed from ten to five on 2026-09-15**, on 95 judged images.
+Coverage saturates at `otsu` + `bgdist`; the other three earn their place on
+which tile Tyler actually starred. The reasoning and the numbers are in the
+comment above `OPTIONAL` in `candidates.py`. Still reachable with
+`--strategies`: `silhouette`, `keyline`, `keyfill`, `keyflip`, `linework`,
+`nested`, `kmeans-layered` (the colour version of `layerlines`, one `<path>` per
+colour — see 2.5), `plate`, `neural`, `edges`, `sauvola`, `inotsu`, `triotsu`.
+
 
 ### 2.3 Two strategies worth explaining properly
 
@@ -172,6 +177,16 @@ The SVG is deliberately minimal:
 - Dimensions emitted in **millimetres** when `--height-mm` is given, so the
   artwork arrives at physical size instead of needing to be scaled by hand.
 
+**The layered exception.** `kmeans-layered` is the one candidate that does not
+reduce to one fill. Every colour cluster becomes its own cleaned mask, goes
+through the *same* `clean_mask()` and `mask_to_paths()`, and is written by
+`paths_to_svg_layered()` as its own `<path>` with its own fill, lightest first
+and darkest last so the darker colour wins an anti-aliased boundary. A
+recolour is then an attribute edit, not a re-trace. It is a different kind of
+deliverable from the two-colour laser file, and the pick step decides which
+kind the job wants - which is why it sits on the slate as a sibling of
+`kmeans` rather than replacing it.
+
 ---
 
 ## 3. Scoring, and why you should not trust it too much
@@ -216,6 +231,17 @@ instead of a single winner. Before that, four good candidates were being logged
 as four losses on every image.
 
 ---
+
+**Scoring a layered candidate.** `hygiene.score_layered()` reuses every
+weight above unchanged; only the measurements differ. Components, jaggedness
+and self-intersections are measured per layer and combined worst-case, never
+averaged. A stray is a small island that touches *only background* - a chain
+link on a blue field is design. Gaps are measured per layer against a colour
+likeness map, not luminance. Fusion is not measured: colours are separate
+layers by construction. Fidelity stays the greyscale edge-F1 on the union of
+layers so `finalize()` can still compare it with its siblings; a second number,
+`fidelity_color`, reports edge-F1 against the source's colour edges, which is
+what a recolourable file should be judged on.
 
 ## 4. Determinism
 
@@ -275,6 +301,15 @@ built.
 A local FastAPI service on loopback plus a static frontend — one HTML file, one
 CSS file, one JS file, no build step.
 
+**Calibration intake.** The app can pull its own work: `_private/new to test/`
+is a queue of artwork waiting for a verdict, and *Trace the next batch* serves
+the next N images that have never been judged. The queue is derived, never
+stored — an image is done when its stem appears in `picks.jsonl` or
+`app-picks.jsonl`, and in flight when it is already the source of a job — so
+there is no state to reset and a verdict removes an image by itself. This
+exists because nothing tracked it before: of 282 intake images, 111 were
+already judged, and every batch re-traced them.
+
 ```
 main.py     window: pywebview → Chrome --app → browser tab
 server.py   FastAPI on 127.0.0.1, imports run_one from candidates.py
@@ -307,6 +342,20 @@ actually *is* rather than trusted from the file — storing absolute paths once
 orphaned every past job the moment the work directory moved.
 
 ---
+
+**Live view (debug, off by default).** Settings → *Live view* shows the
+strategy currently running as one large image that changes about three times
+a second — the mask, then the Bézier curves accumulating over it as they are
+fitted, then the render — and drops it into a small grid when it is scored,
+while the next strategy takes the large slot. Frames are rate-limited at the
+source (`_progress()` in `candidates.py`, `PROGRESS_HZ`), the engine's
+`on_step` hook stores a bare array reference, and the server encodes a 480px
+PNG only when the browser polls and only for frames it has not sent yet - so
+a slow display sees fewer frames and the tracer never waits on it.
+Nothing touches disk unless *keep snapshots* is on and Save is chosen at the
+end; then they land in the job's own history folder, never the project tree.
+Batches that run on multiple worker processes have no live view - a callback
+cannot cross the process boundary.
 
 ## 7. Two rules about recording judgement
 
