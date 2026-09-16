@@ -70,6 +70,23 @@
     <input id="file" type="file" accept="image/*" multiple hidden>
   </section>
 
+  <section id="intake" class="intake" hidden>
+    <div class="intake-text">
+      <b>Calibration intake</b>
+      <span id="intake-count" class="meta"></span>
+    </div>
+    <div class="intake-actions">
+      <label class="meta" for="intake-n">How many</label>
+      <select id="intake-n">
+        <option>5</option>
+        <option selected>10</option>
+        <option>20</option>
+        <option>50</option>
+      </select>
+      <button id="intake-go" class="primary" type="button">Trace the next batch</button>
+    </div>
+  </section>
+
   <section id="progress" class="progress" hidden>
     <div class="bar"><span id="barfill"></span></div>
     <p id="progresstext" class="meta">Tracing…</p>

@@ -158,6 +158,51 @@ async function poll(jobId) {
   loadResults(jobId);
 }
 
+/* ---------------- calibration intake ----------------
+ * `_private/new to test/` is a queue of artwork waiting for a verdict. The
+ * server derives what is left (judged stems are out, stems already in a job
+ * are out), so this panel only has to show the number and ask for a batch.
+ * Hidden entirely when there is no intake folder - a customer install has
+ * none, and an empty control is worse than no control. */
+async function loadIntake() {
+  let j;
+  try {
+    j = await (await apiFetch('/api/intake')).json();
+  } catch (_) { return; }
+  const box = $('#intake');
+  if (!j.exists || (!j.remaining && !j.in_flight)) { box.hidden = true; return; }
+  box.hidden = false;
+  $('#intake-count').textContent = j.remaining
+    ? `${j.remaining} still to judge, ${j.judged} done of ${j.total}`
+    : `Nothing left to judge - ${j.in_flight} waiting on a verdict`;
+  $('#intake-go').disabled = !j.remaining;
+}
+
+$('#intake-go').addEventListener('click', async () => {
+  const btn = $('#intake-go');
+  btn.disabled = true;
+  $('#progress').hidden = false;
+  $('#barfill').style.width = '2%';
+  $('#progresstext').textContent = 'Loading the next batch…';
+  try {
+    const r = await apiFetch('/api/intake/next', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count: Number($('#intake-n').value) }),
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    state.jobId = j.job_id;
+    if (settings.live_view) liveStart(j.job_id);
+    if (j.failed?.length) toast(`Could not read ${j.failed.length} file(s).`, true);
+    poll(j.job_id);
+  } catch (err) {
+    $('#progress').hidden = true;
+    toast(String(err.message || err), true);
+  }
+  loadIntake();
+});
+
 /* ---------------- live view (debug, off by default) ----------------
  * Polls /api/jobs/{id}/live at ~3/s while the job traces. The server holds
  * ONE frame per (image, strategy, step) - the latest - and encodes on
@@ -728,6 +773,9 @@ async function recordJudgement(imgs) {
       });
     } catch (_) { /* never let bookkeeping break the actual work */ }
   }
+  // A verdict is what takes an image out of the calibration queue, so the
+  // count is only ever right if it is re-read here.
+  loadIntake();
 }
 
 
@@ -1205,6 +1253,7 @@ async function checkUpdate() {
 /* ---------------- boot ---------------- */
 loadSettings();
 checkUpdate();
+loadIntake();
 
 
 /* ---------------- full-size candidate viewer ----------------

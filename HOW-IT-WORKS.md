@@ -301,6 +301,15 @@ built.
 A local FastAPI service on loopback plus a static frontend — one HTML file, one
 CSS file, one JS file, no build step.
 
+**Calibration intake.** The app can pull its own work: `_private/new to test/`
+is a queue of artwork waiting for a verdict, and *Trace the next batch* serves
+the next N images that have never been judged. The queue is derived, never
+stored — an image is done when its stem appears in `picks.jsonl` or
+`app-picks.jsonl`, and in flight when it is already the source of a job — so
+there is no state to reset and a verdict removes an image by itself. This
+exists because nothing tracked it before: of 282 intake images, 111 were
+already judged, and every batch re-traced them.
+
 ```
 main.py     window: pywebview → Chrome --app → browser tab
 server.py   FastAPI on 127.0.0.1, imports run_one from candidates.py

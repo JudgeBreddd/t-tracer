@@ -528,19 +528,150 @@ async def create_job(files: list[UploadFile]):
                           + ', '.join(failed))
         raise HTTPException(400, 'No usable images. ' + '; '.join(detail))
 
+    return _start_job(job_id, src, out, accepted, rejected, oversized, failed)
+
+
+def _start_job(job_id, src, out, accepted, rejected=(), oversized=(), failed=()):
+    """Register a job whose source images are already on disk and trace it.
+    Shared by the upload route and the calibration intake route so both
+    produce an identical job record."""
     from datetime import datetime
     JOBS[job_id] = {'id': job_id, 'status': 'queued', 'done': 0,
                     'total': len(accepted), 'src_dir': str(src),
-                    'out_dir': str(out), 'errors': [], 'rejected': rejected,
+                    'out_dir': str(out), 'errors': [], 'rejected': list(rejected),
                     'created': datetime.now().isoformat(timespec='seconds'),
-                    'names': accepted, 'oversized': oversized, 'failed': failed}
+                    'names': accepted, 'oversized': list(oversized),
+                    'failed': list(failed)}
     save_job(JOBS[job_id])
     st = load_settings()
     if st.get('live_view'):
         LIVE[job_id] = LiveView(keep=bool(st.get('live_keep')))
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
-    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected,
-            'oversized': oversized, 'failed': failed}
+    return {'job_id': job_id, 'accepted': accepted, 'rejected': list(rejected),
+            'oversized': list(oversized), 'failed': list(failed)}
+
+
+# --------------------------------------------------------------------------
+# Calibration intake.
+#
+# `_private/new to test/` is a queue of artwork waiting to be judged, and the
+# reason it needs code rather than a drag-and-drop is that NOTHING TRACKED
+# WHAT HAD ALREADY BEEN RUN. Measured 2026-09-15: 282 images, 111 of them
+# already judged, 41 duplicate stems - so pointing a batch at the folder
+# re-traced the same judged images over and over and produced no new
+# calibration data. Tyler, in those words: "he kept running the same 50 over
+# and over."
+#
+# So the queue is derived, never stored: an image is DONE when its stem
+# appears in either picks file, and IN FLIGHT when it is already the source
+# of a job in the work directory. Nothing to keep in sync, nothing to reset,
+# and a judgement made in the app removes it from the queue by itself.
+# --------------------------------------------------------------------------
+
+def _judged_stems() -> set[str]:
+    """Stems that already carry a verdict, from the calibration log and the
+    app's own. A row with pick None counts: 'nothing here is shippable' is a
+    judgement, and re-serving that image would ask the same question twice."""
+    out = set()
+    for f in (_paths.PICKS, APP_PICKS):
+        for row in read_jsonl(f):
+            image = row.get('image')
+            if image:
+                out.add(Path(image).stem)
+    return out
+
+
+def _in_flight_stems() -> set[str]:
+    """Stems already traced into a job and waiting on a verdict, so a second
+    'trace the next ten' does not hand back the ten now on screen."""
+    out = set()
+    for job in JOBS.values():
+        try:
+            src = Path(job.get('src_dir', ''))
+            if src.is_dir():
+                out.update(p.stem for p in src.iterdir() if p.is_file())
+        except OSError:
+            continue
+    return out
+
+
+def _intake_pool() -> tuple[list[Path], dict]:
+    """Unjudged intake images, one per stem, oldest-name-first for a stable
+    order. Returns (files, counts)."""
+    folder = _paths.INTAKE
+    counts = {'total': 0, 'judged': 0, 'in_flight': 0, 'remaining': 0,
+              'folder': str(folder), 'exists': folder.is_dir()}
+    if not folder.is_dir():
+        return [], counts
+    try:
+        files = sorted((p for p in folder.iterdir()
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTS),
+                       key=lambda p: p.name.lower())
+    except OSError:
+        return [], counts
+    judged, flight = _judged_stems(), _in_flight_stems()
+    pool, seen = [], set()
+    for p in files:
+        counts['total'] += 1
+        if p.stem in judged:
+            counts['judged'] += 1
+            continue
+        if p.stem in flight:
+            counts['in_flight'] += 1
+            continue
+        if p.stem in seen:            # same artwork twice under two extensions
+            continue
+        seen.add(p.stem)
+        pool.append(p)
+    counts['remaining'] = len(pool)
+    return pool, counts
+
+
+@app.get('/api/intake')
+def intake_status():
+    _, counts = _intake_pool()
+    return counts
+
+
+class IntakeReq(BaseModel):
+    count: int = 10
+
+
+@app.post('/api/intake/next')
+def intake_next(req: IntakeReq):
+    """Copy the next N unjudged intake images into a fresh job and trace it.
+
+    The files are COPIED, never moved: the intake folder is the only place
+    some of this artwork exists, and a job's work directory is disposable
+    history that the retention setting is allowed to delete.
+    """
+    n = max(1, min(50, int(req.count)))
+    pool, counts = _intake_pool()
+    if not counts['exists']:
+        raise HTTPException(404, f"No intake folder at {counts['folder']}")
+    if not pool:
+        raise HTTPException(400, 'Nothing left to judge: every intake image is '
+                                 'already judged or already in a job.')
+    job_id = uuid.uuid4().hex[:12]
+    src, out = WORK / job_id / 'in', WORK / job_id / 'out'
+    accepted, failed = [], []
+    try:
+        src.mkdir(parents=True, exist_ok=True)
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(507, f'could not create the job folder: {e}')
+    for p in pool[:n]:
+        try:
+            shutil.copy2(p, src / p.name)
+            accepted.append(p.name)
+        except OSError:
+            failed.append(p.name)
+    if not accepted:
+        shutil.rmtree(WORK / job_id, ignore_errors=True)
+        raise HTTPException(507, 'Could not copy any intake image - check disk space.')
+    res = _start_job(job_id, src, out, accepted, failed=failed)
+    res['remaining'] = counts['remaining'] - len(accepted)
+    return res
 
 
 # --------------------------------------------------------------------------
