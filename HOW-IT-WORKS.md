@@ -73,18 +73,20 @@ returns a list of `(mask, colour)` layers instead; it is registered in
 
 | Strategy | Mechanism |
 |---|---|
-| `otsu` | Global luminance threshold. The baseline, and still the most reliable single strategy — shippable in 24 of 26 judged images. |
-| `bgdist` | CIELAB distance from the detected background colour. Does not require the artwork to be darker than its surroundings. Quietly excellent: also 24 of 26. |
-| `kmeans` | Colour clustering, k=5, darker clusters become ink. |
-| `linework` | Decides by **stroke thickness, not colour**. A thin region already *is* a line, so fill it; a thick region is a field, so outline it. Built for crests where a gold outline must become a black outline. |
-| `silhouette` | Everything that is not background, thresholded **inside the artwork only**. |
-| `nested` | Ink as a 2-colouring of the region containment tree. |
-| `composite` | `otsu` as the base, with `nested` allowed to remove ink from large solid fields. |
-| `kmeans-layered` | The `kmeans` colour split **kept all the way to the SVG**: one `<path>` per colour, each with its own fill. k chosen per image; anti-aliasing bands and near-twin colours folded away. Abstains on one-colour art. See 2.5. |
+| `otsu` | Global luminance threshold. The baseline, and still the most reliable single strategy — shippable on 39 of 41 judged images. |
+| `bgdist` | CIELAB distance from the detected background colour. Does not require the artwork to be darker than its surroundings. Shippable on 38 of 41; with `otsu` it covers every image that had anything shippable. |
+| `kmeans` | Colour clustering in CIELAB, k=5, the border-majority cluster is background, everything else is ink. |
+| `composite` | `otsu` as the base, with `nested` (a 2-colouring of the region containment tree from a ControlNet lineart annotator) allowed to remove ink from large solid fields. The answer to "everything went black". Tyler's favourite on 9 of 41 despite the scorer's dislike. |
+| `layerlines` | **The colour split drawn as an engraving.** Same clustering as `kmeans`, k chosen per image, halos and near-twin colours folded away; then every boundary between two colours becomes a black line 0.25% of the long edge wide, and every region darker than L* 40 is filled. Abstains on one-colour art. |
 
-Reachable via `--strategies` but off the default sheet: `plate`, `neural`,
-`edges`, `sauvola`, `inotsu`, `triotsu`. Each lost its place by failing to win
-picks over real artwork, and the reasons are recorded in the source.
+**The sheet was trimmed from ten to five on 2026-09-15**, on 95 judged images.
+Coverage saturates at `otsu` + `bgdist`; the other three earn their place on
+which tile Tyler actually starred. The reasoning and the numbers are in the
+comment above `OPTIONAL` in `candidates.py`. Still reachable with
+`--strategies`: `silhouette`, `keyline`, `keyfill`, `keyflip`, `linework`,
+`nested`, `kmeans-layered` (the colour version of `layerlines`, one `<path>` per
+colour — see 2.5), `plate`, `neural`, `edges`, `sauvola`, `inotsu`, `triotsu`.
+
 
 ### 2.3 Two strategies worth explaining properly
 
@@ -332,11 +334,15 @@ orphaned every past job the moment the work directory moved.
 
 ---
 
-**Live view (debug, off by default).** Settings → *Live view* shows every
-strategy's steps while a single image traces: about three frames a second,
-latest frame per step only, never queued. The engine's `on_step` hook stores a
-bare array reference; the server encodes a 480px PNG only when the browser
-polls, so a slow display sees fewer frames and the tracer never waits on it.
+**Live view (debug, off by default).** Settings → *Live view* shows the
+strategy currently running as one large image that changes about three times
+a second — the mask, then the Bézier curves accumulating over it as they are
+fitted, then the render — and drops it into a small grid when it is scored,
+while the next strategy takes the large slot. Frames are rate-limited at the
+source (`_progress()` in `candidates.py`, `PROGRESS_HZ`), the engine's
+`on_step` hook stores a bare array reference, and the server encodes a 480px
+PNG only when the browser polls and only for frames it has not sent yet - so
+a slow display sees fewer frames and the tracer never waits on it.
 Nothing touches disk unless *keep snapshots* is on and Save is chosen at the
 end; then they land in the job's own history folder, never the project tree.
 Batches that run on multiple worker processes have no live view - a callback

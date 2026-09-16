@@ -45,6 +45,7 @@ def test_live_endpoints_and_save_writes_only_on_request(server, tmp_path):
     h = {'X-T-Tracer-Token': server.SESSION_TOKEN}
     j = c.get('/api/jobs/j1/live', headers=h).json()
     assert j['enabled'] and j['retained'] == 1 and j['frames'][0]['strategy'] == 'otsu'
+    assert c.get(f'/api/jobs/j1/live?since={j["seq"]}', headers=h).json()['frames'] == []
     assert not (out / '_live').exists()
     r = c.post('/api/jobs/j1/live/save', headers=h).json()
     assert r['saved'] == 1
@@ -64,3 +65,29 @@ def test_cli_defaults_come_from_the_parser(server):
         assert hasattr(ns, k)
     assert ns.jobs == 1
     assert server.cli_defaults(on_step=print).on_step is print
+
+
+def test_run_strategies_streams_trace_frames_then_scored(server, tmp_path):
+    """End to end through the engine: with an observer set, a strategy emits
+    mask -> trace (while fitting curves) -> render -> scored, and the module
+    sink is cleared afterwards so the CLI path stays silent."""
+    import cv2
+    import numpy as np
+    import candidates as C
+    img = np.full((240, 240, 3), 255, np.uint8)
+    cv2.circle(img, (120, 120), 80, (0, 0, 0), -1)
+    cv2.circle(img, (120, 120), 30, (255, 255, 255), -1)
+    frames = []
+    C.PROGRESS_HZ = 1e9                      # no throttle inside the test
+    try:
+        args = server.cli_defaults(on_step=lambda n, s, im: frames.append((n, s)))
+        C._MEMO = {}
+        C._run_strategies(['otsu'], img, None, cv2.cvtColor(img, cv2.COLOR_RGB2GRAY),
+                          args, tmp_path, {}, [], args.on_step)
+    finally:
+        C._MEMO = None
+        C.PROGRESS_HZ = 3.0
+    steps = [s for _, s in frames]
+    assert steps[0] == 'mask' and steps[-1] == 'scored'
+    assert 'trace' in steps and 'render' in steps
+    assert C._PROGRESS is None

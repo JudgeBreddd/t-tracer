@@ -164,12 +164,15 @@ async function poll(jobId) {
  * request, so a slow browser just sees fewer frames and the tracer never
  * waits on it. Each tile is one strategy; its image is that strategy's most
  * recent step. Frames that did not change (same seq) are not re-decoded. */
-const live = { jobId: null, seen: new Map(), timer: null };
+const live = { jobId: null, seen: new Map(), frames: new Map(), since: 0, timer: null };
 
 function liveStart(jobId) {
   live.jobId = jobId;
   live.seen.clear();
+  live.frames.clear();
+  live.since = 0;
   $('#live-grid').innerHTML = '';
+  $('#live-big').hidden = true;
   $('#live-actions').hidden = true;
   $('#live').hidden = false;
   livePoll();
@@ -179,25 +182,51 @@ async function livePoll() {
   if (!live.jobId) return;
   let j;
   try {
-    j = await (await apiFetch(`/api/jobs/${live.jobId}/live`)).json();
+    j = await (await apiFetch(`/api/jobs/${live.jobId}/live?since=${live.since}`)).json();
   } catch (_) { return; }
   if (!j.enabled) { $('#live').hidden = true; live.jobId = null; return; }
+  // The server sends only frames newer than `since`; merge into what we hold.
+  for (const f of j.frames) live.frames.set(`${f.stem}|${f.strategy}|${f.step}`, f);
+  live.since = j.seq || live.since;
+  j.frames = [...live.frames.values()];
+  // One BIG tile: the strategy currently running, showing its newest frame
+  // as it changes (about 3/s). When a strategy reaches 'scored' it drops
+  // into the small grid and waits; the next one takes the big slot.
   const grid = $('#live-grid');
+  const big = $('#live-big');
+  const done = new Set(j.frames.filter((f) => f.step === 'scored').map((f) => `${f.stem}|${f.strategy}`));
+  let current = null;
   for (const f of j.frames) {
     const key = `${f.stem}|${f.strategy}`;
-    let tile = grid.querySelector(`[data-key="${CSS.escape(key)}"]`);
-    if (!tile) {
-      tile = document.createElement('div');
-      tile.className = 'live-tile';
-      tile.dataset.key = key;
-      tile.innerHTML = `<img alt=""><span class="meta"><b></b> <span class="step"></span></span>`;
-      tile.querySelector('b').textContent = f.strategy;
-      grid.appendChild(tile);
+    if (done.has(key)) {
+      let tile = grid.querySelector(`[data-key="${CSS.escape(key)}"]`);
+      if (!tile) {
+        tile = document.createElement('div');
+        tile.className = 'live-tile';
+        tile.dataset.key = key;
+        tile.innerHTML = `<img alt=""><span class="meta"><b></b> <span class="step"></span></span>`;
+        tile.querySelector('b').textContent = f.strategy;
+        grid.appendChild(tile);
+      }
+      if (f.step !== 'scored' || live.seen.get(key) === f.seq) continue;
+      live.seen.set(key, f.seq);
+      tile.querySelector('img').src = `data:image/png;base64,${f.png}`;
+      tile.querySelector('.step').textContent = 'done';
+    } else if (!current || f.seq > current.seq) {
+      current = f;
     }
-    if (live.seen.get(key) === f.seq) continue;
-    live.seen.set(key, f.seq);
-    tile.querySelector('img').src = `data:image/png;base64,${f.png}`;
-    tile.querySelector('.step').textContent = f.step;
+  }
+  if (current) {
+    const key = `big|${current.stem}|${current.strategy}`;
+    big.hidden = false;
+    if (live.seen.get(key) !== current.seq) {
+      live.seen.set(key, current.seq);
+      big.querySelector('img').src = `data:image/png;base64,${current.png}`;
+      $('#live-big-name').textContent = current.strategy;
+      $('#live-big-step').textContent = current.step;
+    }
+  } else {
+    big.hidden = true;
   }
   const running = j.status === 'tracing' || j.status === 'queued';
   if (running) {

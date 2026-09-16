@@ -616,10 +616,13 @@ class LiveView:
                                           _live_encode(image)))
         return on_step
 
-    def frames(self) -> list[dict]:
+    def frames(self, since: int = 0) -> list[dict]:
+        """Frames newer than `since` (a seq the client already has), encoded
+        on demand. Sending only what changed keeps a 3/s poll to one or two
+        small PNGs instead of every step of every strategy each time."""
         import base64
         with self.lock:
-            items = list(self.latest.items())
+            items = [(k, v) for k, v in self.latest.items() if v[0] > since]
         out = []
         for key, (seq, image) in items:
             enc = self.encoded.get(key)
@@ -635,14 +638,15 @@ class LiveView:
 
 
 @app.get('/api/jobs/{job_id}/live')
-def job_live(job_id: str):
+def job_live(job_id: str, since: int = 0):
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(404, 'unknown job')
     live = LIVE.get(job_id)
     if live is None:
         return {'enabled': False, 'frames': [], 'retained': 0, 'keep': False}
-    return {'enabled': True, 'frames': live.frames(), 'keep': live.keep,
+    return {'enabled': True, 'frames': live.frames(since), 'keep': live.keep,
+            'seq': live.seq,
             'retained': len(live.retained),
             'status': job.get('status', 'unknown')}
 

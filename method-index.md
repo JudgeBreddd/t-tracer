@@ -4,7 +4,7 @@ One entry per strategy: the ordered steps it runs, and every parameter that
 touches its result. Built to drive the parameter sweep, not to explain the code
 — for *why* a method exists, read its docstring in `_engine/candidates.py`.
 
-**Complete:** 11 default + 6 optional + 3 archived. Written 2026-09-08; `kmeans-layered` added 2026-09-15.
+**Complete:** 5 default + 13 optional + 3 archived. Written 2026-09-08; `kmeans-layered` and `layerlines` added and the sheet trimmed to five 2026-09-15 (evidence in the `OPTIONAL` comment in `candidates.py`).
 
 ---
 
@@ -132,7 +132,27 @@ colour.
 | attempts / iters / eps | 4 / 30 / 0.5 (hardcoded) |
 | border band `b` | ≤4 px (hardcoded) |
 
-## kmeans-layered — 0 picks (new 2026-09-15)
+## layerlines — 0 picks (new 2026-09-15, ON the sheet)
+
+`kmeans-layered`'s clustering (below, steps 1-6, with a 1px core and a 4px
+minimum fragment so detail survives) and then, instead of colour layers:
+
+7. Boundary pixels: any pixel whose right or lower neighbour has a different
+   cluster label, marked on both sides
+8. Dilate the boundary by an ellipse `line_frac` × long edge (4px at 1600)
+9. OR in every layer whose centre colour is darker than `fill_L` (CIELAB L*)
+10. Boolean mask → the shared `clean_mask` → `mask_to_paths` → `hygiene.score`
+
+| parameter | default |
+|---|---|
+| `line_frac` | 0.0025 of the long edge (6px filled the LCS wheel spokes; 4px kept them) |
+| `fill_L` | 40 |
+| core radius / min core | 1 px / 4 px (detail on this path is line, not wrong colour) |
+
+Known limit: white detail narrower than the line width (a railing's gaps) is
+eaten by the outline stroke. `otsu` on the same sheet keeps it.
+
+## kmeans-layered — 0 picks (new 2026-09-15, OPTIONAL: the colour version)
 
 The only strategy that returns LAYERS (`list[(mask, rgb)]`) rather than one
 mask; registered in `LAYERED` and emitted by `_emit_layered`. Steps 1-2 as

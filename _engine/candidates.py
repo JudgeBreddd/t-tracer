@@ -298,11 +298,12 @@ def _true_lab(centers):
     return c
 
 
-def _between(c, others, slack=0.3):
+def _between(c, others, slack=0.3, want_pair=False):
     """If colour `c` lies on the straight line between some pair of `others`
     (within `slack` of that pair's separation), return the index into
-    `others` of the nearer endpoint; else None. True for the mixed pixels of
-    an anti-aliased edge between two flat colours."""
+    `others` of the nearer endpoint - or, with `want_pair`, the tuple
+    (a, b, nearer) - else None. True for the mixed pixels of an anti-aliased
+    edge between two flat colours."""
     best = None
     for a in range(len(others)):
         for b in range(a + 1, len(others)):
@@ -315,12 +316,15 @@ def _between(c, others, slack=0.3):
             if 0.05 < t < 0.95:
                 off = float(np.linalg.norm(c - (pa + t * ab)))
                 if off < slack * np.sqrt(L) and (best is None or off < best[0]):
-                    best = (off, a if t < 0.5 else b)
-    return None if best is None else best[1]
+                    best = (off, a, b, a if t < 0.5 else b)
+    if best is None:
+        return None
+    return best[1:] if want_pair else best[3]
 
 
 def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
-                         merge_de=15.0):
+                         merge_de=15.0, core_r=None, min_core=None,
+                         _return_labels=False):
     """`kmeans`, but the colour split is KEPT all the way to the SVG.
 
     Same Lab k-means, same border-majority background solve. Instead of
@@ -397,6 +401,7 @@ def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
             continue
         if areas[i] / art_area < min_frac:
             fold(i, nearest(i))
+    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     for i in sorted([j for j in alive if j != bg_label], key=lambda j: areas[j]):
         if len(alive) <= 2:
             break
@@ -405,9 +410,18 @@ def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
         thin = 2.0 * float(dt[m].mean()) < halo_px
         if thin:
             others = [j for j in alive if j != i]
-            end = _between(tlab[i], tlab[others])
+            end = _between(tlab[i], tlab[others], want_pair=True)
             if end is not None:
-                fold(i, others[end])
+                a, b, nearer = end
+                # A halo sits BETWEEN its two colours in the image too: its
+                # ring touches both. Thin grey detail drawn inside black (a
+                # lighthouse railing) is between black and white in colour
+                # but touches only black - that is artwork, and it stays.
+                ring = (cv2.dilate(m.astype(np.uint8), k3) > 0) & ~m
+                nb = np.bincount(labels[ring], minlength=k) if ring.any() else np.zeros(k)
+                tot = max(1, nb.sum())
+                if nb[others[a]] / tot >= 0.2 and nb[others[b]] / tot >= 0.2:
+                    fold(i, others[nearer])
     changed = True
     while changed and len(alive) > 2:
         changed = False
@@ -432,8 +446,10 @@ def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
     # is the same anti-aliasing seen end-on (blue|green mixes to a dark blob
     # the black cluster claims); it is dropped so the propagation fills it
     # from the real regions around it. Real detail keeps cores far larger.
-    core_r = max(1, int(round(0.001 * max(h, w))))
-    min_core = max(4, int(round((0.004 * max(h, w)) ** 2)))
+    if core_r is None:
+        core_r = max(1, int(round(0.001 * max(h, w))))
+    if min_core is None:
+        min_core = max(4, int(round((0.004 * max(h, w)) ** 2)))
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * core_r + 1,) * 2)
     core = np.full((h, w), -1, np.int32)
     for i in alive:
@@ -460,9 +476,64 @@ def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
         rgb_c = cv2.cvtColor(c8, cv2.COLOR_LAB2RGB).reshape(3)
         layers.append((float(centers[i][0]), mask, tuple(int(v) for v in rgb_c)))
     if len(layers) < 2:
-        return []                                  # one colour: that is `kmeans`
+        return ([], None, None) if _return_labels else []   # one colour: that is `kmeans`
     layers.sort(key=lambda t: -t[0])               # lightest first, darkest on top
-    return [(m, c) for _, m, c in layers]
+    out = [(m, c) for _, m, c in layers]
+    if _return_labels:
+        return out, labels, bg_label
+    return out
+
+
+def strat_layerlines(rgb, line_frac=0.0025, fill_L=40.0, **kw):
+    """Black-and-white output built ON the colour layering.
+
+    Tyler, 2026-09-15, on seeing `kmeans-layered` in colour: gaps between
+    colours, blobbed, no lines - "we need strong black lines with a white
+    background". The colour split is still the right instrument (it is the
+    only one that sees structure luminance thresholding fuses); what the
+    laser wants is the DRAWING of that split:
+
+      * every boundary between two different colour regions - including a
+        colour against the background - becomes a black line `line_frac` of
+        the long edge wide (4px at 1600; 6px filled the wheel spokes on the
+        LCS Squadron One emblem, 4px kept them). This is what the hairline seams
+        between separately-traced colour layers turn into: one stroke that
+        covers them, instead of a gap;
+      * every region darker than `fill_L` (CIELAB L*) is filled black - the
+        navy rope, the black ring - so the plate still has its solid darks;
+      * light and mid colours (gold, red, white) stay bare, outlined.
+
+    Detail survives because the boundary clean-up is turned down to a 1px
+    core with a tiny minimum fragment: on this path a sliver along an edge
+    is not a wrong colour, it is part of the line.
+    """
+    h, w = rgb.shape[:2]
+    res = strat_kmeans_layered(rgb, core_r=1, min_core=4, _return_labels=True, **kw)
+    layers, labels, bg_label = res
+    if not layers:
+        return np.zeros((h, w), dtype=bool)        # abstain: one colour
+
+    # Boundaries: a pixel whose right or lower neighbour has a different
+    # label. Marked on both sides so the line is centred on the edge.
+    edge = np.zeros((h, w), dtype=bool)
+    dif = labels[:, 1:] != labels[:, :-1]
+    edge[:, 1:] |= dif
+    edge[:, :-1] |= dif
+    dif = labels[1:, :] != labels[:-1, :]
+    edge[1:, :] |= dif
+    edge[:-1, :] |= dif
+
+    line_px = max(2, int(round(line_frac * max(h, w))))
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (line_px, line_px))
+    lines = cv2.dilate(edge.astype(np.uint8), ker) > 0
+
+    ink = lines.copy()
+    for mask, color in layers:
+        L = cv2.cvtColor(np.asarray(color, np.uint8).reshape(1, 1, 3),
+                         cv2.COLOR_RGB2LAB)[0, 0, 0] * 100.0 / 255.0
+        if L < fill_L:
+            ink |= mask
+    return ink
 
 
 def strat_inotsu(rgb, alpha=None, lab_tol=14.0):
@@ -650,6 +721,28 @@ def strat_silhouette(rgb, alpha=None, lab_tol=14.0):
 # ---------------------------------------------------------------------------
 
 _MEMO = None
+
+# Live-view progress sink (see run_one's on_step). `_PROGRESS` is set per
+# strategy by _run_strategies to a callable(step, image) and is None for the
+# CLI; `_progress()` is the only thing long loops call, and when the sink is
+# None it is one comparison. Frames are rate-limited HERE, at the source, to
+# PROGRESS_HZ so a tight loop cannot flood the display or slow itself down.
+_PROGRESS = None
+_PROGRESS_T = 0.0
+PROGRESS_HZ = 3.0
+
+
+def _progress(step, make_image):
+    """Emit a live frame if one is due. `make_image` is a zero-arg callable
+    so the frame is only built when it will be shown."""
+    global _PROGRESS_T
+    if _PROGRESS is None:
+        return
+    now = time.monotonic()
+    if now - _PROGRESS_T < 1.0 / PROGRESS_HZ:
+        return
+    _PROGRESS_T = now
+    _PROGRESS(step, make_image())
 
 
 def _memo(name, fn, *args, **kw):
@@ -1703,36 +1796,48 @@ STRATEGIES = {
     'otsu':       strat_otsu,
     'bgdist':     strat_bgdist,
     'kmeans':     strat_kmeans,
-    'linework':   strat_linework,
-    'silhouette': strat_silhouette,
-    'nested':     strat_nested,
     'composite':  strat_composite,
-    'keyline':    strat_keyline,
-    'keyfill':    strat_keyfill,
-    'keyflip':    strat_keyflip,
-    'kmeans-layered': strat_kmeans_layered,
+    'layerlines': strat_layerlines,
 }
+
+# THE SHEET WAS TRIMMED FROM 10 TO 5 ON 2026-09-15, on evidence, at Tyler's
+# call ("3-5 total strats is the goal"). The evidence, from 95 judged images
+# (79 with a full shippable set; the clean all-ten pool is n=41, 2026-09-08):
+#
+#   * coverage saturates at TWO: otsu + bgdist alone give at least one
+#     shippable candidate on 40/41 images, and the 41st had nothing shippable
+#     from anyone. Every other strategy has marginal coverage value 0 - no
+#     image loses its only shippable candidate when it is removed.
+#   * favourite-pick retention (which tile Tyler actually starred, n=40):
+#     {otsu, bgdist, kmeans, composite} keeps 34/40 = 85%, the best four.
+#     composite is his favourite on 9/41 despite a median overall of 0.0 -
+#     the scorer disagrees with him, and the scorer is the suspect.
+#   * near-duplicates by mask IoU (n=58): otsu/bgdist median 0.947 and
+#     identical (>0.95) on half of all images; bgdist/kmeans 0.831. They are
+#     kept as a pair because they are also the ONLY two with coverage value.
+#   * cut from the sheet: linework (0 favourites, 75% of runs under 20/100),
+#     nested (0 favourites; still runs INSIDE composite), keyflip (1
+#     favourite, 2 of 3 runs unscorable), keyfill (strict subset of keyline's
+#     shippable images in both pools), keyline and silhouette (2 favourites
+#     each in the all-ten pool; silhouette was sole-cover on 5 of 16 OLD
+#     single-pick rows judged against a 7-strategy roster, so it is the one
+#     cut to revisit if a job ever has nothing shippable).
+#   * layerlines is new (2026-09-15): black outlines of every colour boundary
+#     plus dark fills, from the kmeans colour split. Abstains on one-colour
+#     art, where the other four already do the job.
+#
+# Everything cut is still reachable with --strategies for a calibration run.
+OPTIONAL = {'silhouette': strat_silhouette, 'keyline': strat_keyline,
+            'keyfill': strat_keyfill, 'keyflip': strat_keyflip,
+            'linework': strat_linework, 'nested': strat_nested,
+            'kmeans-layered': strat_kmeans_layered,
+            'edges': strat_edges, 'sauvola': strat_sauvola,
+            'neural': strat_neural, 'plate': strat_plate,
+            'inotsu': strat_inotsu, 'triotsu': strat_triotsu}
 
 # Strategies that return LAYERS - a list of (bool mask, (r, g, b)) - instead of
 # one boolean mask. They go through `_emit_layered`, not the single-mask path.
 LAYERED = {'kmeans-layered'}
-
-# `plate` demoted 2026-09-05 at the reviewer's call. It was the most elaborate
-# strategy and the most iterated on, and it never won a single pick in the
-# project's history; once rows could hold a SET, it appeared in only 2 of 17
-# shippable sets. Sophistication has not been paying here. Same treatment as
-# `neural` -- still reachable via --strategies, off the default sheet.
-#
-# `edges` is still reachable with --strategies but is off the default sheet:
-# it never won a pick, and it exists for photographs of physical patches,
-# which is not the work in front of this pipeline right now. Six tiles is
-# already the limit of a glance-and-choose decision.
-# `inotsu` isolates the artwork-only-population idea. Kept reachable because it
-# proved the mechanism on `red-eye logo`, but off the sheet: it differs from plain
-# `otsu` by 0.15-3.4% of pixels, which is sheet clutter, not a candidate.
-OPTIONAL = {'edges': strat_edges, 'sauvola': strat_sauvola,
-            'neural': strat_neural, 'plate': strat_plate,
-            'inotsu': strat_inotsu, 'triotsu': strat_triotsu}
 ALL_STRATEGIES = {**STRATEGIES, **OPTIONAL}
 
 # Strategies that can use the source's alpha channel when one exists.
@@ -1970,7 +2075,25 @@ def mask_to_paths(mask, scale=6, smooth=3.0, tol=0.6, min_points=16):
         if segs:
             paths.append([(p0 / scale, c1 / scale, c2 / scale, p3 / scale)
                           for p0, c1, c2, p3 in segs])
+            # Live view: the fitted curves so far, drawn over a faint mask.
+            _progress('trace', lambda: _progress_canvas(mask, paths))
     return paths
+
+
+def _progress_canvas(mask, paths, long_edge=480):
+    """A small RGB frame: the mask in light grey with the Bezier paths fitted
+    so far stroked in black. Built only when a live frame is due."""
+    h, w = mask.shape
+    s = long_edge / max(h, w)
+    small = cv2.resize(mask.astype(np.uint8) * 255, (max(1, int(w * s)), max(1, int(h * s))),
+                       interpolation=cv2.INTER_AREA)
+    canvas = np.full((small.shape[0], small.shape[1], 3), 255, np.uint8)
+    canvas[small > 127] = (215, 215, 215)
+    for segs in paths:
+        pts = (_sample_beziers(segs, per_seg=6) * s).astype(np.int32)
+        if len(pts) >= 2:
+            cv2.polylines(canvas, [pts], True, (0, 0, 0), 1, cv2.LINE_AA)
+    return canvas
 
 
 # ---------------------------------------------------------------------------
@@ -2221,6 +2344,8 @@ def _run_strategies(names, rgb, alpha, src_gray, args, out_dir, results,
             mask = ~mask
         if on_step:
             on_step(name, 'mask', mask)
+            global _PROGRESS
+            _PROGRESS = lambda step, img, _n=name: on_step(_n, step, img)
         mask = clean_mask(mask, src_gray, args.close, args.open, args.min_area_frac)
         if getattr(args, 'min_island', 0):
             mask = _grow_counters(mask, args.min_island)
@@ -2231,6 +2356,9 @@ def _run_strategies(names, rgb, alpha, src_gray, args, out_dir, results,
         if ink_frac < 0.001 or ink_frac > 0.98:
             print(f'  {name:<8} degenerate ({ink_frac:.1%} ink) - not emitted')
             results[name] = {'rejected': f'degenerate ink fraction {ink_frac:.3f}'}
+            _PROGRESS = None
+            if on_step:
+                on_step(name, 'scored', mask)
             continue
 
         paths = mask_to_paths(mask, scale=args.scale, smooth=args.smoothing,
@@ -2238,6 +2366,7 @@ def _run_strategies(names, rgb, alpha, src_gray, args, out_dir, results,
         if not paths:
             print(f'  {name:<8} produced no usable contours')
             results[name] = {'rejected': 'no contours'}
+            _PROGRESS = None
             continue
 
         svg = paths_to_svg(paths, w, h,
@@ -2246,6 +2375,8 @@ def _run_strategies(names, rgb, alpha, src_gray, args, out_dir, results,
         (out_dir / f'{name}.svg').write_text(svg)
 
         rendered = rasterize(paths, w, h, ss=args.raster_ss)
+        if on_step:
+            on_step(name, 'render', rendered)
         sc = hygiene.score(rendered, src_gray, paths, count_nodes(paths),
                            height_mm=args.height_mm, ss=args.raster_ss, src_h=h,
                            src_rgb=rgb)
@@ -2256,6 +2387,7 @@ def _run_strategies(names, rgb, alpha, src_gray, args, out_dir, results,
         cv2.imwrite(str(out_dir / f'{name}.png'), prev)
         previews.append((name, prev))
         if on_step:
+            _PROGRESS = None
             on_step(name, 'scored', rendered)
 
 

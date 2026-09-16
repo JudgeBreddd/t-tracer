@@ -14,7 +14,7 @@ def _flat_logo(size=320):
     img = np.full((size, size, 3), 255, np.uint8)
     c = size // 2
     cv2.circle(img, (c, c), size // 3, (0, 0, 0), -1, cv2.LINE_AA)
-    cv2.circle(img, (c, c), size // 3 - 8, (40, 80, 200), -1, cv2.LINE_AA)
+    cv2.circle(img, (c, c), size // 3 - 8, (60, 120, 220), -1, cv2.LINE_AA)   # L* ~52
     cv2.rectangle(img, (c - size // 4, c - 14), (c + size // 4, c + 14),
                   (250, 200, 20), -1, cv2.LINE_AA)
     return img
@@ -142,3 +142,40 @@ def test_rasterize_evenodd_hole_survives_buffer_reuse():
         return [(pts[i], pts[i], pts[(i + 1) % 4], pts[(i + 1) % 4]) for i in range(4)]
     r = C.rasterize([square(10., 90.), square(30., 70.)], 100, 100, ss=1)
     assert r[20, 20] and not r[50, 50]
+
+
+def test_layerlines_outlines_every_boundary_and_fills_dark():
+    img = _flat_logo()
+    ink = C.strat_layerlines(img)
+    assert ink.dtype == bool and ink.shape == img.shape[:2]
+    c = img.shape[0] // 2
+    assert ink[c, c - img.shape[0] // 3 + 2]          # the black ring is filled
+    assert ink[c - 14, c]                              # bar/disc boundary is a line
+    assert not ink[c, c]                                # yellow bar interior stays bare
+    assert not ink[c - 60, c]                           # blue disc interior stays bare (L* 40+)
+
+
+def test_layerlines_abstains_on_one_colour_art():
+    img = np.full((200, 200, 3), 255, np.uint8)
+    cv2.circle(img, (100, 100), 60, (0, 0, 0), -1)
+    assert not C.strat_layerlines(img).any()
+
+
+def test_default_sheet_is_five():
+    assert list(C.STRATEGIES) == ['otsu', 'bgdist', 'kmeans', 'composite', 'layerlines']
+    assert 'silhouette' in C.OPTIONAL and 'kmeans-layered' in C.OPTIONAL
+    assert C.LAYERED == {'kmeans-layered'}
+
+
+def test_progress_sink_is_silent_when_unset_and_throttled_when_set():
+    seen = []
+    assert C._PROGRESS is None
+    C._progress('x', lambda: seen.append(1) or 'img')
+    assert seen == []                                   # image never built
+    C._PROGRESS = lambda step, img: seen.append((step, img))
+    C._PROGRESS_T = 0.0
+    try:
+        C._progress('a', lambda: 'A'); C._progress('b', lambda: 'B')
+        assert seen == [('a', 'A')]                      # second frame inside 1/3 s dropped
+    finally:
+        C._PROGRESS = None
