@@ -56,6 +56,7 @@ from scipy.interpolate import splprep, splev
 from scipy.spatial import cKDTree
 from skimage.filters import threshold_multiotsu, threshold_sauvola
 from skimage.measure import label
+from skimage.morphology import skeletonize
 from scipy.ndimage import binary_fill_holes, distance_transform_edt, find_objects
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
@@ -484,7 +485,8 @@ def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
     return out
 
 
-def strat_layerlines(rgb, line_frac=0.0025, fill_L=40.0, **kw):
+def strat_layerlines(rgb, line_frac=0.002, fill_L=40.0, protect_white=True,
+                     **kw):
     """Black-and-white output built ON the colour layering.
 
     Tyler, 2026-09-15, on seeing `kmeans-layered` in colour: gaps between
@@ -495,8 +497,9 @@ def strat_layerlines(rgb, line_frac=0.0025, fill_L=40.0, **kw):
 
       * every boundary between two different colour regions - including a
         colour against the background - becomes a black line `line_frac` of
-        the long edge wide (4px at 1600; 6px filled the wheel spokes on the
-        LCS Squadron One emblem, 4px kept them). This is what the hairline seams
+        the long edge wide (3px at 1600), with any white channel the stroke
+        would have closed carved back out - see `_keep_white_channels`, and
+        the note there for why no width alone could be right. This is what the hairline seams
         between separately-traced colour layers turn into: one stroke that
         covers them, instead of a gap;
       * every region darker than `fill_L` (CIELAB L*) is filled black - the
@@ -527,13 +530,46 @@ def strat_layerlines(rgb, line_frac=0.0025, fill_L=40.0, **kw):
     ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (line_px, line_px))
     lines = cv2.dilate(edge.astype(np.uint8), ker) > 0
 
-    ink = lines.copy()
+    fill = np.zeros((h, w), dtype=bool)
     for mask, color in layers:
         L = cv2.cvtColor(np.asarray(color, np.uint8).reshape(1, 1, 3),
                          cv2.COLOR_RGB2LAB)[0, 0, 0] * 100.0 / 255.0
         if L < fill_L:
-            ink |= mask
-    return ink
+            fill |= mask
+
+    if protect_white:
+        lines = _keep_white_channels(lines, fill, line_px)
+    return lines | fill
+
+
+def _keep_white_channels(lines, fill, line_px):
+    """Stop the outline stroke from closing a bare channel narrower than
+    itself.
+
+    Tyler, 2026-09-15, shown the stroke at 4, 6 and 8px: "none - left closest
+    but no". No width can be right, because the defect is not the width. A
+    stroke `line_px` wide swallows every bare gap narrower than `line_px`, and
+    on the LCS Squadron One lighthouse the railing's gaps are about 3px at the
+    1600px working size. A thinner stroke only moves which detail dies.
+
+    So the medial axis of the bare area is carved back out of the stroke
+    WHERE THE BARE AREA IS NARROW - within `line_px` of ink, which is exactly
+    where the stroke would have closed it. Each such channel keeps a
+    one-pixel white spine and reads as two edges rather than one blob.
+
+    Restricting it to narrow places is what makes it safe. In open space the
+    medial axis runs far from any ink, the stroke never reaches it, and the
+    stroke comes back untouched - so this cannot punch holes in a legitimate
+    boundary line, which is the defect it would otherwise trade for. It also
+    covers a channel that is open at both ends (a stripe between two fields),
+    which an earlier enclosed-region-only version missed.
+    """
+    bare = ~fill
+    if not bare.any() or not lines.any():
+        return lines
+    dist = cv2.distanceTransform(bare.astype(np.uint8), cv2.DIST_L2, 3)
+    spine = skeletonize(bare) & (dist <= float(line_px))
+    return lines & ~spine
 
 
 def strat_inotsu(rgb, alpha=None, lab_tol=14.0):

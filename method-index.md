@@ -139,18 +139,28 @@ minimum fragment so detail survives) and then, instead of colour layers:
 
 7. Boundary pixels: any pixel whose right or lower neighbour has a different
    cluster label, marked on both sides
-8. Dilate the boundary by an ellipse `line_frac` × long edge (4px at 1600)
-9. OR in every layer whose centre colour is darker than `fill_L` (CIELAB L*)
-10. Boolean mask → the shared `clean_mask` → `mask_to_paths` → `hygiene.score`
+8. Dilate the boundary by an ellipse `line_frac` × long edge (3px at 1600)
+9. **Carve the bare area's medial axis back out of the stroke, where the bare
+   area is within `line_px` of ink** (`_keep_white_channels`) — so a channel
+   the stroke would have closed keeps a one-pixel white spine
+10. OR in every layer whose centre colour is darker than `fill_L` (CIELAB L*)
+11. Boolean mask → the shared `clean_mask` → `mask_to_paths` → `hygiene.score`
 
 | parameter | default |
 |---|---|
-| `line_frac` | 0.0025 of the long edge (6px filled the LCS wheel spokes; 4px kept them) |
+| `line_frac` | 0.002 of the long edge (3px at 1600) |
+| `protect_white` | True — step 9 |
 | `fill_L` | 40 |
 | core radius / min core | 1 px / 4 px (detail on this path is line, not wrong colour) |
 
-Known limit: white detail narrower than the line width (a railing's gaps) is
-eaten by the outline stroke. `otsu` on the same sheet keeps it.
+Step 9 exists because Tyler rejected every width. Shown 4, 6 and 8px: *"none
+— left closest but no"*. The defect was never the width: a stroke `line_px`
+wide swallows every bare gap narrower than itself, and a thinner stroke only
+moves which detail dies. The LCS Squadron One lighthouse railing has ~3px
+gaps at the 1600px working size and was solid black at every width; with
+step 9 it survives. Restricting the carve to narrow places is what keeps it
+from punching holes in legitimate boundary lines — in open space the medial
+axis is far from any ink and the stroke never reaches it.
 
 ## kmeans-layered — 0 picks (new 2026-09-15, OPTIONAL: the colour version)
 

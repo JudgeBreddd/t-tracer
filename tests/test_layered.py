@@ -209,3 +209,38 @@ def test_fusion_penalty_is_area_led_with_a_capped_count_term():
     assert pen(many_small) < pen(one_big)
     assert pen(many_small) <= 5.8               # count term cannot sink it alone
     assert pen({'fusions': 0, 'fused_area_frac': 1.0}) == 40.0
+
+
+def test_stroke_never_closes_a_white_channel_narrower_than_itself():
+    """Two dark blocks with a 3px bare channel between them, outlined with a
+    stroke wide enough to swallow it. The channel must survive as at least a
+    one-pixel white spine, or the two blocks read as one."""
+    fill = np.zeros((60, 60), bool)
+    fill[10:50, 10:28] = True
+    fill[10:50, 31:50] = True                 # 3px bare channel at x=28..30
+    edge = np.zeros((60, 60), bool)
+    edge[10:50, 27:32] = True                 # the boundary between them
+    lines = cv2.dilate(edge.astype(np.uint8),
+                       cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))) > 0
+    assert not (~fill & ~lines)[20:40, 28:31].any()      # unprotected: gone
+    kept = C._keep_white_channels(lines, fill, line_px=7)
+    channel = (~fill & ~kept)[15:45, 27:32]
+    assert channel.any(), 'the channel was closed anyway'
+
+
+def test_protection_leaves_a_stroke_in_open_space_alone():
+    """A stroke that closes nothing must come back byte-identical - otherwise
+    protection would punch holes in legitimate boundary lines."""
+    fill = np.zeros((60, 60), bool)
+    fill[10:50, 10:30] = True                 # one block, open white around it
+    lines = cv2.dilate(fill.astype(np.uint8),
+                       cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))) > 0
+    assert np.array_equal(C._keep_white_channels(lines, fill, line_px=5), lines)
+
+
+def test_layerlines_keeps_a_thin_light_stripe_between_two_dark_fields():
+    img = np.full((240, 240, 3), 255, np.uint8)
+    img[60:180, 40:118] = (18, 18, 18)
+    img[60:180, 122:200] = (22, 22, 60)       # second dark field, different hue
+    ink = C.strat_layerlines(img, line_frac=0.03)   # ~7px stroke, channel is 4px
+    assert not ink[110:130, 118:122].all(), 'the light stripe was filled in'
