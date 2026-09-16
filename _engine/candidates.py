@@ -56,7 +56,7 @@ from scipy.interpolate import splprep, splev
 from scipy.spatial import cKDTree
 from skimage.filters import threshold_multiotsu, threshold_sauvola
 from skimage.measure import label
-from scipy.ndimage import binary_fill_holes, distance_transform_edt
+from scipy.ndimage import binary_fill_holes, distance_transform_edt, find_objects
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff'}
 
@@ -250,6 +250,221 @@ def strat_kmeans(rgb, k=5):
     return labels != bg_label
 
 
+def _kmeans_lab(flat, k, attempts=4):
+    """Seeded k-means on an Nx3 float32 Lab array. cv2.kmeans draws its
+    initial centres from a process-global RNG, so the seed is reset
+    immediately before EVERY call - see the determinism note in main()."""
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.5)
+    cv2.setRNGSeed(0)
+    compact, labels, centers = cv2.kmeans(flat, k, None, crit, attempts,
+                                          cv2.KMEANS_PP_CENTERS)
+    return compact, labels.ravel(), centers
+
+
+def _pick_k(flat, k_min=2, k_max=8, sample=20000, min_gain=0.12):
+    """Choose the number of colour clusters by the elbow of within-cluster
+    scatter on a fixed 20k-pixel sample. Stops at the first k whose extra
+    cluster cuts the scatter by less than `min_gain` of the previous value.
+
+    Insignia are flat-colour art: a 3-colour patch has a sharp elbow at 3, a
+    7-colour one keeps gaining until 7. A fixed k=5 over-splits the first into
+    anti-aliasing bands and under-splits the second into muddy merges.
+    """
+    if len(flat) > sample:
+        idx = np.random.default_rng(0).choice(len(flat), sample, replace=False)
+        flat = flat[idx]
+    n_unique = len(np.unique(flat, axis=0))
+    k_max = max(k_min, min(k_max, n_unique))
+    prev = None
+    best = k_min
+    for k in range(k_min, k_max + 1):
+        compact, _, _ = _kmeans_lab(flat, k, attempts=3)
+        if prev is not None and (prev - compact) < min_gain * prev:
+            break
+        best = k
+        prev = compact
+    return best
+
+
+def _true_lab(centers):
+    """OpenCV's 8-bit Lab packs L as 0-255 and a/b as offset 128, so a
+    Euclidean distance on it weights lightness 2.55x over chroma - light grey
+    came out 'nearer' to green than to white. Every colour DECISION here is
+    made in real CIELAB units; only the clustering itself runs on the packed
+    values (that is what `kmeans` does, and the assignment is the same)."""
+    c = np.asarray(centers, dtype=np.float64).copy()
+    c[:, 0] *= 100.0 / 255.0
+    c[:, 1:] -= 128.0
+    return c
+
+
+def _between(c, others, slack=0.3):
+    """If colour `c` lies on the straight line between some pair of `others`
+    (within `slack` of that pair's separation), return the index into
+    `others` of the nearer endpoint; else None. True for the mixed pixels of
+    an anti-aliased edge between two flat colours."""
+    best = None
+    for a in range(len(others)):
+        for b in range(a + 1, len(others)):
+            pa, pb = others[a], others[b]
+            ab = pb - pa
+            L = float(np.dot(ab, ab))
+            if L < 1e-6:
+                continue
+            t = float(np.dot(c - pa, ab)) / L
+            if 0.05 < t < 0.95:
+                off = float(np.linalg.norm(c - (pa + t * ab)))
+                if off < slack * np.sqrt(L) and (best is None or off < best[0]):
+                    best = (off, a if t < 0.5 else b)
+    return None if best is None else best[1]
+
+
+def strat_kmeans_layered(rgb, k=0, min_frac=0.015, k_max=8, halo_px=3.0,
+                         merge_de=15.0):
+    """`kmeans`, but the colour split is KEPT all the way to the SVG.
+
+    Same Lab k-means, same border-majority background solve. Instead of
+    collapsing every non-background cluster into one boolean mask, each
+    cluster becomes its own layer with its own representative colour, so the
+    output is one <path> per colour and a recolour is an attribute edit.
+
+    Returns a list of (bool mask, (r, g, b)) in stacking order: lightest first,
+    darkest last (drawn on top) - the same 'darker is ink' reading `kmeans`
+    already makes, so where clusters meet at an anti-aliased edge the darker
+    colour wins the boundary.
+
+    Differences from `kmeans`, both deliberate:
+      * k is chosen per image (`_pick_k`) unless given; fixed k=5 over-splits
+        a 3-colour patch into anti-aliasing bands and under-splits a 7-colour one.
+      * clusters under `min_frac` of the artwork are noise, not colours: their
+        pixels are merged into the nearest surviving cluster in Lab.
+
+    This does NOT decide which layers are 'ink' for a single-colour burn. That
+    is a discrete call over 2-7 cluster colours instead of a per-pixel one,
+    and the per-layer metadata in metrics.json (`layers`) is what a later
+    classifier or a human would decide it from.
+    """
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    h, w, _ = lab.shape
+    flat = lab.reshape(-1, 3)
+    if k <= 0:
+        k = _pick_k(flat, k_max=k_max)
+    k = min(k, len(np.unique(flat[::max(1, len(flat) // 50000)], axis=0)))
+    if k < 2:
+        return []
+    _, labels, centers = _kmeans_lab(flat, k)
+    labels = labels.reshape(h, w)
+
+    b = max(1, min(4, h // 4, w // 4))
+    border = np.concatenate([
+        labels[:b, :].ravel(), labels[-b:, :].ravel(),
+        labels[:, :b].ravel(), labels[:, -b:].ravel(),
+    ])
+    bg_label = int(np.bincount(border, minlength=k).argmax())
+
+    # Three kinds of cluster are NOT colours, and each is folded into the
+    # nearest surviving centre (Lab distance). No second k-means, so nothing
+    # new to seed.
+    #   1. too small      - under `min_frac` of the artwork
+    #   2. a halo         - thin (mean local thickness under ~3px) AND its
+    #                       colour lies between two other clusters' colours:
+    #                       the anti-aliasing ramp where two flat colours meet.
+    #                       Thin alone is not enough - a gold keyline is thin
+    #                       and is a colour; gold is not between black and white.
+    #   3. a near-twin    - within `merge_de` of another centre (shading,
+    #                       JPEG noise), folded into the larger of the two
+    areas = np.bincount(labels.ravel(), minlength=k).astype(np.float64)
+    art_area = areas.sum() - areas[bg_label]
+    if art_area <= 0:
+        return []
+    alive = list(range(k))
+    tlab = _true_lab(centers)
+
+    def fold(i, into):
+        nonlocal labels
+        labels = np.where(labels == i, into, labels)
+        areas[into] += areas[i]
+        areas[i] = 0
+        alive.remove(i)
+
+    def nearest(i):
+        cand = [j for j in alive if j != i]
+        d = np.linalg.norm(tlab[cand] - tlab[i], axis=1)
+        return cand[int(np.argmin(d))]
+
+    for i in sorted(range(k), key=lambda j: areas[j]):
+        if i == bg_label or len(alive) <= 2:
+            continue
+        if areas[i] / art_area < min_frac:
+            fold(i, nearest(i))
+    for i in sorted([j for j in alive if j != bg_label], key=lambda j: areas[j]):
+        if len(alive) <= 2:
+            break
+        m = labels == i
+        dt = cv2.distanceTransform(m.astype(np.uint8), cv2.DIST_L2, 3)
+        thin = 2.0 * float(dt[m].mean()) < halo_px
+        if thin:
+            others = [j for j in alive if j != i]
+            end = _between(tlab[i], tlab[others])
+            if end is not None:
+                fold(i, others[end])
+    changed = True
+    while changed and len(alive) > 2:
+        changed = False
+        for i in sorted([j for j in alive if j != bg_label], key=lambda j: areas[j]):
+            j = nearest(i)
+            if j != bg_label and np.linalg.norm(tlab[i] - tlab[j]) < merge_de:
+                fold(i, j)
+                changed = True
+                break
+    if len(alive) < 2:
+        return []
+
+    # Anti-aliased boundaries: where two flat colours meet, the mixed pixels
+    # get assigned to whichever cluster is nearest in Lab - often a THIRD
+    # colour (blue|yellow -> the green cluster), which draws a one-pixel
+    # sliver of that colour along the whole edge. Thousands of paths, every
+    # penalty pinned at its cap. So each cluster keeps only its eroded core,
+    # and every remaining pixel goes to the nearest core: boundaries land on
+    # the midline between the two real regions and slivers have no core to
+    # survive from. A line 3px wide keeps a 1px core, so keylines survive.
+    # A core fragment smaller than ~(0.4% of the long edge)^2 - 40px at 1600 -
+    # is the same anti-aliasing seen end-on (blue|green mixes to a dark blob
+    # the black cluster claims); it is dropped so the propagation fills it
+    # from the real regions around it. Real detail keeps cores far larger.
+    core_r = max(1, int(round(0.001 * max(h, w))))
+    min_core = max(4, int(round((0.004 * max(h, w)) ** 2)))
+    ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * core_r + 1,) * 2)
+    core = np.full((h, w), -1, np.int32)
+    for i in alive:
+        m = cv2.erode((labels == i).astype(np.uint8), ker)
+        n_c, lbl_c, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+        small = np.where(stats[:, cv2.CC_STAT_AREA] < min_core)[0]
+        if small.size:
+            m[np.isin(lbl_c, small[small != 0])] = 0
+        core[m > 0] = i
+    if (core >= 0).any():
+        _, (iy, ix) = distance_transform_edt(core < 0, return_indices=True)
+        labels = core[iy, ix]
+
+    layers = []
+    for i in alive:
+        if i == bg_label:
+            continue
+        mask = labels == i
+        if not mask.any():
+            continue
+        # Representative colour: the cluster centre, back through OpenCV's
+        # 8-bit Lab so the swatch matches what the pixels actually were.
+        c8 = np.clip(centers[i], 0, 255).astype(np.uint8).reshape(1, 1, 3)
+        rgb_c = cv2.cvtColor(c8, cv2.COLOR_LAB2RGB).reshape(3)
+        layers.append((float(centers[i][0]), mask, tuple(int(v) for v in rgb_c)))
+    if len(layers) < 2:
+        return []                                  # one colour: that is `kmeans`
+    layers.sort(key=lambda t: -t[0])               # lightest first, darkest on top
+    return [(m, c) for _, m, c in layers]
+
+
 def strat_inotsu(rgb, alpha=None, lab_tol=14.0):
     """Otsu computed over the ARTWORK ONLY, not the whole frame.
 
@@ -278,11 +493,7 @@ def strat_inotsu(rgb, alpha=None, lab_tol=14.0):
     which is a second, separable idea. This strategy isolates the population
     fix alone, so the two can be judged apart on the sheet.
     """
-    if alpha is not None and alpha.min() < 250:
-        art = alpha > 128
-    else:
-        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-        art = np.linalg.norm(lab - _background_color(lab), axis=2) > lab_tol
+    art = _silhouette_of(rgb, alpha, lab_tol)
 
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     inside = gray[art]
@@ -336,11 +547,7 @@ def strat_triotsu(rgb, alpha=None, lab_tol=14.0):
     """
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
 
-    if alpha is not None and alpha.min() < 250:
-        art = alpha > 128
-    else:
-        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-        art = np.linalg.norm(lab - _background_color(lab), axis=2) > lab_tol
+    art = _silhouette_of(rgb, alpha, lab_tol)
     if art.sum() < 16:
         return strat_otsu(rgb)
 
@@ -410,12 +617,7 @@ def strat_silhouette(rgb, alpha=None, lab_tol=14.0):
     useless on a plate. Ringing the silhouette and OR-ing the interior's dark
     detail back in gives the shield's edge AND everything drawn inside it.
     """
-    if alpha is not None and alpha.min() < 250:
-        sil = alpha > 128
-    else:
-        lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-        bg = _background_color(lab)
-        sil = np.linalg.norm(lab - bg, axis=2) > lab_tol
+    sil = _silhouette_of(rgb, alpha, lab_tol)
 
     if not sil.any():
         return sil
@@ -435,6 +637,27 @@ def strat_silhouette(rgb, alpha=None, lab_tol=14.0):
         inner = np.zeros_like(sil)
 
     return ring | inner
+
+
+# ---------------------------------------------------------------------------
+# Per-image memo. run_one() opens it before the strategy loop and closes it
+# after; while it is open, a strategy that is built on another strategy's
+# mask (keyfill -> keyline, composite -> otsu + nested) gets the mask that
+# strategy already produced for the same image instead of recomputing it.
+# Outside run_one the memo is None and every call computes, so the strategies
+# stay ordinary functions. Only default-argument calls are memoised - a call
+# with overrides is a different computation and always runs.
+# ---------------------------------------------------------------------------
+
+_MEMO = None
+
+
+def _memo(name, fn, *args, **kw):
+    if _MEMO is None or kw:
+        return fn(*args, **kw)
+    if name not in _MEMO:
+        _MEMO[name] = fn(*args, **kw)
+    return _MEMO[name].copy()
 
 
 def _silhouette_of(rgb, alpha=None, lab_tol=14.0):
@@ -723,7 +946,7 @@ def strat_keyfill(rgb, alpha=None, floor_frac=0.0022, **kw):
     judged. Same reasoning that made `composite` a new strategy instead of an
     edit to `neural`.
     """
-    ink = strat_keyline(rgb, alpha, **kw)
+    ink = _memo('keyline', strat_keyline, rgb, alpha, **kw)
     if not ink.any():
         return ink                                 # keyline abstained
     return _thicken_thin(ink, _floor_px(rgb, floor_frac))
@@ -743,7 +966,7 @@ def strat_keyflip(rgb, alpha=None, floor_frac=0.0022, **kw):
     emblems, which are pure line drawings -- there is nothing to turn inside
     out and this correctly declines to occupy a tile.
     """
-    ink = strat_keyline(rgb, alpha, **kw)
+    ink = _memo('keyline', strat_keyline, rgb, alpha, **kw)
     if not ink.any():
         return ink                                 # keyline abstained
     flipped = _flip_fields(ink, ring_px=max(1, round(0.0015 * max(rgb.shape[:2]))))
@@ -1273,9 +1496,9 @@ def strat_neural(rgb, alpha=None, hi=0.15, lo=0.04, blur=1.0, stroke=1,
     if ids:
         L = np.asarray(Ls, dtype=np.float32)
         wgt = np.asarray(sizes, dtype=np.float64)
-        lo, hi = float(L.min()), float(L.max())
-        if hi - lo > 1e-3:
-            c = np.array([lo, hi], dtype=np.float32)
+        l_min, l_max = float(L.min()), float(L.max())
+        if l_max - l_min > 1e-3:
+            c = np.array([l_min, l_max], dtype=np.float32)
             for _ in range(25):                    # 1-D 2-means, area weighted
                 a = np.argmin(np.abs(L[:, None] - c[None, :]), axis=1)
                 for j in (0, 1):
@@ -1446,8 +1669,8 @@ def strat_composite(rgb, alpha=None, solid_frac=0.015, knock_frac=0.0006,
     fleur-de-lis), the composite cannot bring it back. That failure mode needs
     a different answer.
     """
-    base = strat_otsu(rgb)
-    field = strat_nested(rgb, alpha=alpha, **kw)
+    base = _memo('otsu', strat_otsu, rgb)
+    field = _memo('nested', strat_nested, rgb, alpha, **kw)
 
     total = float(base.size)
     n_b, lbl_b = cv2.connectedComponents(base.astype(np.uint8), connectivity=8)
@@ -1487,7 +1710,12 @@ STRATEGIES = {
     'keyline':    strat_keyline,
     'keyfill':    strat_keyfill,
     'keyflip':    strat_keyflip,
+    'kmeans-layered': strat_kmeans_layered,
 }
+
+# Strategies that return LAYERS - a list of (bool mask, (r, g, b)) - instead of
+# one boolean mask. They go through `_emit_layered`, not the single-mask path.
+LAYERED = {'kmeans-layered'}
 
 # `plate` demoted 2026-09-05 at the reviewer's call. It was the most elaborate
 # strategy and the most iterated on, and it never won a single pick in the
@@ -1610,12 +1838,17 @@ def clean_mask(mask, src_gray=None, close_px=2, open_px=1, min_area_frac=0.0004)
         # For each ink island, which non-ink region surrounds it? Dilate by one
         # and read the labels that appear alongside it.
         k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        # Each island is tested inside its own bounding box (one pixel of
+        # margin, so the 3x3 dilate cannot leave it) rather than on a full
+        # image comparison per island. Same answer; O(island) not O(image).
+        boxes = find_objects(lab)
         for i in np.where(~keep)[0]:
-            if i == 0 or sizes[i] == 0:
+            if i == 0 or sizes[i] == 0 or boxes[i - 1] is None:
                 continue
-            comp = (lab == i).astype(np.uint8)
+            sl = tuple(slice(max(0, b.start - 1), b.stop + 1) for b in boxes[i - 1])
+            comp = (lab[sl] == i).astype(np.uint8)
             ring = (cv2.dilate(comp, k3, iterations=1) > 0) & ~comp.astype(bool)
-            around = np.unique(holes[ring])
+            around = np.unique(holes[sl][ring])
             around = around[around != 0]
             # nested == every surrounding non-ink region is an interior one
             if around.size and not (set(int(a) for a in around) & outer):
@@ -1774,6 +2007,44 @@ def paths_to_svg(paths, w, h, ink='#000000', background=None, height_mm=None):
     return '\n'.join(out)
 
 
+def _hex(color):
+    r, g, b = (int(round(float(c))) for c in color[:3])
+    return f'#{r:02X}{g:02X}{b:02X}'
+
+
+def paths_to_svg_layered(layers, w, h, background=None, height_mm=None):
+    """One <path> PER COLOUR, each with its own fill and fill-rule evenodd so a
+    colour's interior holes still knock out within that colour. Layers are
+    written in the order given: first is the bottom of the stack.
+
+    This is the kmeans-layered deliverable: a customer colour change becomes
+    'edit one fill attribute', not 're-run the tracer'. It deliberately breaks
+    the one-fill rule in _engine/laser-output-rules.md - a layered file is a
+    different kind of output, and the pick step decides which kind the job
+    wants.
+    """
+    if height_mm:
+        dims = f'width="{w / h * height_mm:.3f}mm" height="{height_mm:.3f}mm"'
+    else:
+        dims = f'width="{w}" height="{h}"'
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" {dims} viewBox="0 0 {w} {h}">']
+    if background:
+        out.append(f'<rect width="{w}" height="{h}" fill="{background}"/>')
+    for paths, color in layers:
+        d = []
+        for segs in paths:
+            p0 = segs[0][0]
+            d.append(f'M{p0[0]:.3f},{p0[1]:.3f}')
+            for _, c1, c2, p3 in segs:
+                d.append(f'C{c1[0]:.3f},{c1[1]:.3f} {c2[0]:.3f},{c2[1]:.3f} {p3[0]:.3f},{p3[1]:.3f}')
+            d.append('Z')
+        out.append(f'<path id="layer-{_hex(color)[1:]}" fill-rule="evenodd" '
+                   f'fill="{_hex(color)}" d="{" ".join(d)}"/>')
+    out.append('</svg>')
+    return '\n'.join(out)
+
+
 def rasterize(paths, w, h, ss=2):
     """Render the emitted geometry back to a boolean mask.
 
@@ -1782,15 +2053,18 @@ def rasterize(paths, w, h, ss=2):
     including anything the curve fit changed.
     """
     canvas = np.zeros((h * ss, w * ss), np.uint8)
+    layer = np.zeros_like(canvas)
     for segs in paths:
         pts = _sample_beziers(segs, per_seg=16) * ss
         if len(pts) < 3:
             continue
         # XOR each subpath in turn - this IS the even-odd rule, so a contour
         # nested inside another knocks a hole rather than filling it solid.
-        layer = np.zeros_like(canvas)
+        # One scratch layer, cleared and reused: at 1600px x ss=2 a fresh
+        # 10 MB allocation per subpath was the largest single cost in scoring.
+        layer.fill(0)
         cv2.fillPoly(layer, [pts.astype(np.int32)], 255)
-        canvas = cv2.bitwise_xor(canvas, layer)
+        cv2.bitwise_xor(canvas, layer, dst=canvas)
     return canvas > 0
 
 
@@ -1870,23 +2144,88 @@ def run_one(img_path, out_root, args):
     results = {}
     previews = []
 
+    # Optional per-step observer: on_step(strategy, step, image) with `image`
+    # an HxW bool mask, an HxWx3 RGB image, or a list of (mask, rgb) layers.
+    # Costs one attribute read when unset. The app's live view plugs in here;
+    # the CLI never sets it.
+    on_step = getattr(args, 'on_step', None)
+
+    global _MEMO
+    _MEMO = {}
+    try:
+        _run_strategies(names, rgb, alpha, src_gray, args, out_dir,
+                        results, previews, on_step)
+    finally:
+        _MEMO = None
+
+    # Fidelity only means something compared across candidates from the same
+    # image, so ranking happens once every candidate exists - never inside the
+    # loop, where a strategy would be graded against itself.
+    hygiene.finalize(results)
+
+    for name, sc in sorted(results.items(),
+                           key=lambda kv: -kv[1].get('overall', -1)):
+        if 'hygiene' not in sc:
+            print(f'  {name:<8} rejected: {sc["rejected"]}')
+            continue
+        print(f'  {name:<8} {sc["overall"]:>5.1f} overall  '
+              f'(hygiene {sc["hygiene"]:>5.1f}, detail {sc["fidelity_rel"]:.2f})  '
+              f'{sc["nodes"]:>5} nodes  {sc["paths"]:>3} paths  -- {sc["headline"]}')
+
+    (out_dir / 'metrics.json').write_text(json.dumps(results, indent=2))
+    if previews:
+        # All sheets land in one folder. Per-image folders are right for the
+        # deliverables, but reviewing means flipping through every sheet in a
+        # row, and that should be one directory of images, not fifteen clicks.
+        sheets = out_root / '_sheets'
+        sheets.mkdir(parents=True, exist_ok=True)
+        _contact_sheet([(n, p, results[n]) for n, p in previews],
+                       rgb, sheets / f'{img_path.stem}.png')
+    return results
+
+
+def _run_strategies(names, rgb, alpha, src_gray, args, out_dir, results,
+                    previews, on_step=None):
+    """The strategy loop of run_one. One entry in `results` per requested
+    strategy: a score dict, or {'rejected': why} - a strategy that raises is
+    recorded too, so a missing tile in the app always has a stated reason."""
+    import hygiene
+    h, w = rgb.shape[:2]
+
     for name in names:
-        fn = ALL_STRATEGIES.get(name.strip())
+        name = name.strip()
+        fn = ALL_STRATEGIES.get(name)
         if fn is None:
             print(f'  ! unknown strategy {name!r}, skipping')
             continue
 
         try:
-            mask = fn(rgb, alpha) if name.strip() in ALPHA_AWARE else fn(rgb)
+            if name in LAYERED:
+                out = fn(rgb)
+            elif name in ALPHA_AWARE:
+                out = _memo(name, fn, rgb, alpha)
+            else:
+                out = _memo(name, fn, rgb)
         except Exception as e:
             print(f'  {name:<8} FAILED: {type(e).__name__}: {e}')
+            results[name] = {'rejected': f'failed: {type(e).__name__}: {e}'}
             continue
 
+        if name in LAYERED:
+            _emit_layered(name, out, rgb, src_gray, args, out_dir, results,
+                          previews, on_step)
+            continue
+
+        mask = out
         if args.invert:
             mask = ~mask
+        if on_step:
+            on_step(name, 'mask', mask)
         mask = clean_mask(mask, src_gray, args.close, args.open, args.min_area_frac)
         if getattr(args, 'min_island', 0):
             mask = _grow_counters(mask, args.min_island)
+        if on_step:
+            on_step(name, 'clean', mask)
 
         ink_frac = float(mask.mean())
         if ink_frac < 0.001 or ink_frac > 0.98:
@@ -1916,31 +2255,81 @@ def run_one(img_path, out_root, args):
         prev = cv2.resize(prev, (w, h), interpolation=cv2.INTER_AREA)
         cv2.imwrite(str(out_dir / f'{name}.png'), prev)
         previews.append((name, prev))
+        if on_step:
+            on_step(name, 'scored', rendered)
 
-    # Fidelity only means something compared across candidates from the same
-    # image, so ranking happens once every candidate exists - never inside the
-    # loop, where a strategy would be graded against itself.
-    hygiene.finalize(results)
 
-    for name, sc in sorted(results.items(),
-                           key=lambda kv: -kv[1].get('overall', -1)):
-        if 'hygiene' not in sc:
-            print(f'  {name:<8} rejected: {sc["rejected"]}')
-            continue
-        print(f'  {name:<8} {sc["overall"]:>5.1f} overall  '
-              f'(hygiene {sc["hygiene"]:>5.1f}, detail {sc["fidelity_rel"]:.2f})  '
-              f'{sc["nodes"]:>5} nodes  {sc["paths"]:>3} paths  -- {sc["headline"]}')
+def _emit_layered(name, layers, rgb, src_gray, args, out_dir, results,
+                  previews, on_step=None):
+    """Emission for a LAYERED strategy: one cleaned mask -> one <path> per
+    colour, stacked in the order the strategy returned them (bottom first).
+    Reuses clean_mask / mask_to_paths unchanged per layer; only the SVG
+    writer, the raster, the preview and the scorer are the layered variants."""
+    import hygiene
+    h, w = rgb.shape[:2]
+    if on_step:
+        on_step(name, 'mask', layers)
 
-    (out_dir / 'metrics.json').write_text(json.dumps(results, indent=2))
-    if previews:
-        # All sheets land in one folder. Per-image folders are right for the
-        # deliverables, but reviewing means flipping through every sheet in a
-        # row, and that should be one directory of images, not fifteen clicks.
-        sheets = out_root / '_sheets'
-        sheets.mkdir(parents=True, exist_ok=True)
-        _contact_sheet([(n, p, results[n]) for n, p in previews],
-                       rgb, sheets / f'{img_path.stem}.png')
-    return results
+    cleaned = []
+    for mask, color in layers:
+        m = clean_mask(mask, src_gray, args.close, args.open, args.min_area_frac)
+        if getattr(args, 'min_island', 0):
+            m = _grow_counters(m, args.min_island)
+        if m.any():
+            cleaned.append((m, color))
+    if on_step:
+        on_step(name, 'clean', cleaned)
+
+    union = np.zeros((h, w), dtype=bool)
+    for m, _ in cleaned:
+        union |= m
+    ink_frac = float(union.mean())
+    if len(cleaned) < 2 or ink_frac < 0.001 or ink_frac > 0.98:
+        why = ('abstained: fewer than two colours' if len(cleaned) < 2
+               else f'degenerate ink fraction {ink_frac:.3f}')
+        print(f'  {name:<8} {why} - not emitted')
+        results[name] = {'rejected': why}
+        return
+
+    traced = []                                    # (paths, color)
+    for m, color in cleaned:
+        paths = mask_to_paths(m, scale=args.scale, smooth=args.smoothing,
+                              tol=args.tol)
+        if paths:
+            traced.append((paths, color))
+    if len(traced) < 2:
+        results[name] = {'rejected': 'fewer than two layers produced contours'}
+        return
+
+    svg = paths_to_svg_layered(traced, w, h,
+                               background='#FFFFFF' if args.bg else None,
+                               height_mm=args.height_mm)
+    (out_dir / f'{name}.svg').write_text(svg)
+
+    rendered = [(rasterize(paths, w, h, ss=args.raster_ss), paths, color)
+                for paths, color in traced]
+    sc = hygiene.score_layered(rendered, src_gray, rgb, height_mm=args.height_mm,
+                               ss=args.raster_ss, src_h=h)
+    sc['layers'] = [
+        {'fill': _hex(color), 'area_frac': round(float(r.mean()), 4),
+         'paths': len(paths), 'nodes': count_nodes(paths)}
+        for r, paths, color in rendered]
+    results[name] = sc
+
+    prev = composite_layers(rendered, w, h)
+    cv2.imwrite(str(out_dir / f'{name}.png'), cv2.cvtColor(prev, cv2.COLOR_RGB2BGR))
+    previews.append((name, prev))
+    if on_step:
+        on_step(name, 'scored', prev)
+
+
+def composite_layers(rendered, w, h):
+    """Paint (raster, paths, colour) layers bottom-first over white and return
+    an HxWx3 RGB uint8 preview at the source size."""
+    out = np.full((rendered[0][0].shape[0], rendered[0][0].shape[1], 3), 255, np.uint8)
+    for r, _, color in rendered:
+        out[r] = color
+    return cv2.resize(out, (w, h), interpolation=cv2.INTER_AREA)
 
 
 def rank_candidates(metrics):
@@ -1971,7 +2360,9 @@ def _contact_sheet(previews, source_rgb, path, tile_h=340):
         s = tile_h / ih
         r = cv2.resize(img, (max(1, int(iw * s)), tile_h),
                        interpolation=cv2.INTER_AREA)
-        return r if is_color else cv2.cvtColor(r, cv2.COLOR_GRAY2BGR)
+        if r.ndim == 3:                     # RGB preview (a layered candidate)
+            return r if is_color else cv2.cvtColor(r, cv2.COLOR_RGB2BGR)
+        return cv2.cvtColor(r, cv2.COLOR_GRAY2BGR)
 
     order = [n for n, _ in rank_candidates({n: s for n, _, s in previews})]
     by_name = {n: (p, s) for n, p, s in previews}
@@ -2040,7 +2431,9 @@ def _run_one_quiet(img_path, out_root, args):
         return run_one(img_path, out_root, args)
 
 
-def main():
+def build_parser():
+    """The CLI's argparse parser. Separate from main() so the app can take
+    the DEFAULTS from it (server.cli_defaults) instead of re-typing them."""
     ap = argparse.ArgumentParser(
         description='Emit N candidate laser SVGs per image, scored for vector hygiene.')
     ap.add_argument('--only', help='process just this filename')
@@ -2105,7 +2498,11 @@ def main():
                          f'keep native). Sources of {NATIVE_MAX_PX}px or less '
                          'always keep native size.')
     ap.add_argument('--out', default='candidates', help='output folder name')
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     if args.height_mm <= 0:
         args.height_mm = None

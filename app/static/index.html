@@ -75,6 +75,17 @@
     <p id="progresstext" class="meta">Tracing…</p>
   </section>
 
+  <section id="live" class="live" hidden>
+    <div class="live-head">
+      <span class="meta">Live view (debug) — one frame per step, latest only</span>
+      <span id="live-actions" class="live-actions" hidden>
+        <button id="live-save" class="primary" type="button">Save snapshots</button>
+        <button id="live-discard" class="ghost" type="button">Discard</button>
+      </span>
+    </div>
+    <div id="live-grid" class="live-grid"></div>
+  </section>
+
   <section id="results" class="results" hidden></section>
 
 </main>

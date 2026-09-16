@@ -44,7 +44,7 @@ const state = { jobId: null, images: [], sel: {}, fav: {}, failed: {},
  * ORIGIN, and http://127.0.0.1:41337 is a different origin from
  * http://127.0.0.1:39112. Every start was a fresh, empty store. A settings
  * file next to the work directory does not care which port the app got. */
-let settings = { dest: '', share_stats: false, role: 'user' };
+let settings = { dest: '', share_stats: false, role: 'user', live_view: false, live_keep: false };
 
 async function loadSettings() {
   try {
@@ -125,6 +125,7 @@ async function upload(fileList) {
     if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
     const j = await r.json();
     state.jobId = j.job_id;
+    if (settings.live_view) liveStart(j.job_id);
     if (j.rejected?.length) toast(`Skipped ${j.rejected.length} non-image file(s).`, true);
     if (j.oversized?.length) toast(`Skipped ${j.oversized.length} file(s) over the upload size limit.`, true);
     // Distinct from "oversized" - a write failure (e.g. the disk is full) is
@@ -156,6 +157,80 @@ async function poll(jobId) {
   setTimeout(() => { $('#progress').hidden = true; }, 900);
   loadResults(jobId);
 }
+
+/* ---------------- live view (debug, off by default) ----------------
+ * Polls /api/jobs/{id}/live at ~3/s while the job traces. The server holds
+ * ONE frame per (image, strategy, step) - the latest - and encodes on
+ * request, so a slow browser just sees fewer frames and the tracer never
+ * waits on it. Each tile is one strategy; its image is that strategy's most
+ * recent step. Frames that did not change (same seq) are not re-decoded. */
+const live = { jobId: null, seen: new Map(), timer: null };
+
+function liveStart(jobId) {
+  live.jobId = jobId;
+  live.seen.clear();
+  $('#live-grid').innerHTML = '';
+  $('#live-actions').hidden = true;
+  $('#live').hidden = false;
+  livePoll();
+}
+
+async function livePoll() {
+  if (!live.jobId) return;
+  let j;
+  try {
+    j = await (await apiFetch(`/api/jobs/${live.jobId}/live`)).json();
+  } catch (_) { return; }
+  if (!j.enabled) { $('#live').hidden = true; live.jobId = null; return; }
+  const grid = $('#live-grid');
+  for (const f of j.frames) {
+    const key = `${f.stem}|${f.strategy}`;
+    let tile = grid.querySelector(`[data-key="${CSS.escape(key)}"]`);
+    if (!tile) {
+      tile = document.createElement('div');
+      tile.className = 'live-tile';
+      tile.dataset.key = key;
+      tile.innerHTML = `<img alt=""><span class="meta"><b></b> <span class="step"></span></span>`;
+      tile.querySelector('b').textContent = f.strategy;
+      grid.appendChild(tile);
+    }
+    if (live.seen.get(key) === f.seq) continue;
+    live.seen.set(key, f.seq);
+    tile.querySelector('img').src = `data:image/png;base64,${f.png}`;
+    tile.querySelector('.step').textContent = f.step;
+  }
+  const running = j.status === 'tracing' || j.status === 'queued';
+  if (running) {
+    live.timer = setTimeout(livePoll, 333);
+    return;
+  }
+  // Done. Retained frames are the user's call: save or trash, never automatic.
+  if (j.keep && j.retained > 0) {
+    $('#live-actions').hidden = false;
+  } else {
+    await apiFetch(`/api/jobs/${live.jobId}/live/discard`, { method: 'POST' }).catch(() => {});
+    setTimeout(() => { $('#live').hidden = true; }, 1500);
+    live.jobId = null;
+  }
+}
+
+$('#live-save').addEventListener('click', async () => {
+  if (!live.jobId) return;
+  try {
+    const r = await apiFetch(`/api/jobs/${live.jobId}/live/save`, { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    toast(`Saved ${j.saved} snapshot${j.saved === 1 ? '' : 's'} to ${j.dir}`);
+  } catch (err) { toast(String(err.message || err), true); }
+  $('#live').hidden = true;
+  live.jobId = null;
+});
+$('#live-discard').addEventListener('click', async () => {
+  if (!live.jobId) return;
+  await apiFetch(`/api/jobs/${live.jobId}/live/discard`, { method: 'POST' }).catch(() => {});
+  $('#live').hidden = true;
+  live.jobId = null;
+});
 
 /* ---------------- results ---------------- */
 async function loadResults(jobId) {
@@ -911,6 +986,40 @@ async function loadSettingsTab() {
   box.innerHTML = '';
   box.appendChild(storageGroup(storageInfo));
   box.appendChild(autoUpdateGroup(updateState));
+  box.appendChild(liveViewGroup());
+}
+
+/* Live view: a diagnostic, not a customer feature. Both switches only write
+ * settings; the server decides per job at creation time whether to attach
+ * an observer, so flipping them mid-trace changes the NEXT job, not this one. */
+function liveViewGroup() {
+  const g = document.createElement('section');
+  g.className = 'statgroup';
+  g.innerHTML = `<h2>Live view (debug)</h2>
+    <p class="sub">Show each strategy's steps while a job traces - about three
+      frames a second, latest frame only, nothing queued. Off by default. If a
+      step already looks wrong mid-run, that is the step that introduced it.
+      Single-image jobs only.</p>`;
+  const wrap = document.createElement('div');
+  wrap.className = 'share';
+  const mk = (key, text) => {
+    const label = document.createElement('label');
+    label.className = 'optin';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!settings[key];
+    const span = document.createElement('span');
+    span.textContent = text;
+    label.append(cb, span);
+    cb.addEventListener('change', () => saveSettings({ [key]: cb.checked }));
+    return label;
+  };
+  wrap.appendChild(mk('live_view', 'Show the live view while tracing'));
+  wrap.appendChild(mk('live_keep',
+    'Keep every snapshot until the job ends, then ask whether to save them '
+    + '(into the job\'s own history folder) or discard them'));
+  g.appendChild(wrap);
+  return g;
 }
 
 /* Item 3.5: the toggle only ever writes settings.auto_update=true/false - the

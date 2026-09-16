@@ -4,7 +4,7 @@ One entry per strategy: the ordered steps it runs, and every parameter that
 touches its result. Built to drive the parameter sweep, not to explain the code
 — for *why* a method exists, read its docstring in `_engine/candidates.py`.
 
-**Complete:** 10 default + 6 optional + 3 archived. Written 2026-09-08.
+**Complete:** 11 default + 6 optional + 3 archived. Written 2026-09-08; `kmeans-layered` added 2026-09-15.
 
 ---
 
@@ -131,6 +131,37 @@ colour.
 | `k` | 5 |
 | attempts / iters / eps | 4 / 30 / 0.5 (hardcoded) |
 | border band `b` | ≤4 px (hardcoded) |
+
+## kmeans-layered — 0 picks (new 2026-09-15)
+
+The only strategy that returns LAYERS (`list[(mask, rgb)]`) rather than one
+mask; registered in `LAYERED` and emitted by `_emit_layered`. Steps 1-2 as
+`kmeans`, then:
+
+1. RGB → Lab, flatten to Nx3
+2. k chosen per image: `_pick_k` runs seeded k-means for k=2.. on a 20k-pixel
+   sample and stops at the first k whose extra cluster cuts within-cluster
+   scatter by under 12% (`min_gain`)
+3. K-means at that k, seed 0, 4 attempts; border-majority cluster = background
+4. Fold, in real CIELAB units (`_true_lab` - OpenCV's packed Lab weights L 2.55x):
+   clusters under `min_frac` of the artwork → nearest centre; clusters that are
+   thin (mean thickness < `halo_px`) AND lie between two other centres
+   (`_between`) → the nearer endpoint; centres within `merge_de` → the larger
+5. Boundary clean-up: each cluster keeps only its eroded core (radius 0.1% of
+   the long edge, fragments under (0.4% long edge)² dropped); every other pixel
+   goes to the nearest core (`distance_transform_edt`)
+6. Layers ordered lightest → darkest (darkest drawn last); abstains with fewer
+   than two non-background layers
+7. Per layer: `clean_mask` → `mask_to_paths` (shared, unchanged) →
+   `paths_to_svg_layered` (one `<path>` per layer) → `hygiene.score_layered`
+
+| parameter | default |
+|---|---|
+| `k` | 0 = choose per image (`_pick_k`, `k_max` 8, `min_gain` 0.12) |
+| `min_frac` | 0.015 of artwork area |
+| `halo_px` | 3.0 (mean local thickness, work px) |
+| `merge_de` | 15.0 (real CIELAB) |
+| core radius / min core | 0.1% long edge / (0.4% long edge)² (hardcoded) |
 
 ## bgdist — 5 picks
 

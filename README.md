@@ -70,6 +70,7 @@ interface shows you pictures instead of a number.
 | `silhouette` | Everything that is not background, thresholded **inside the artwork only**. Wins on saturated mid-tones that global thresholds drop. |
 | `nested` | Ink as a 2-colouring of the containment tree: a region flips relative to the region that contains it. Uses a ControlNet lineart annotator for boundaries. |
 | `composite` | `otsu` as the base, with `nested` allowed to punch holes in large solid fields. Answers the "everything went black" failure. |
+| `kmeans-layered` | The colour split kept all the way to the SVG: one `<path>` per colour, each with its own fill, so a recolour is an attribute edit. Abstains on one-colour art. |
 
 `--strategies` also reaches `plate`, `neural`, `edges`, `sauvola`, `inotsu` and
 `triotsu`, all of which lost their place on the default sheet by failing to win

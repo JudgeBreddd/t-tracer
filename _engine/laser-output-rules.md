@@ -5,6 +5,7 @@ The standing constraints every stage's output has to satisfy. Referenced from `0
 ## Contrast and fill
 
 - Exactly two colors, absolute: `#000000` (black — engrave/vaporize) and `#FFFFFF` (white — masked/knockout/bare material). No grays, no anti-aliased edges, no gradients.
+  - **The one deliberate exception:** the `kmeans-layered` candidate emits one `<path>` per source colour so a customer recolour is an attribute edit. It is a *different kind of deliverable* — a recolourable master, not a burn file — and it still has to be reduced to two colours (per-layer fill edits) before it meets this rule. Choosing it is the pick step's call, per job.
 - Every filled region is a closed path. No open strokes standing in for fills.
 - **Which element gets black vs. white is decided per-job in `04_assemble`'s `color-map.md`**, not fixed here and not baked into `library/` shapes (those stay color-agnostic geometry — see `library/CONTEXT.md`). This rule says the output must reduce to exactly two colors; it doesn't say which elements land on which side of that split.
 

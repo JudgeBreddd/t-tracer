@@ -172,6 +172,10 @@ def measure_fusions(ink, src_rgb, min_frac=0.12, delta_e=22.0, min_comp_px=400):
         if len(pts) > 20000:                       # subsample large components
             pts = pts[np.random.default_rng(0).choice(len(pts), 20000, replace=False)]
         try:
+            # cv2.kmeans seeds from a process-global RNG. Without this reset the
+            # fusion count - and so the rank order - depended on how many
+            # strategies had run before it. Same fix as candidates.py's own.
+            cv2.setRNGSeed(0)
             _, lbl, centers = cv2.kmeans(pts, 2, None, crit, 3,
                                          cv2.KMEANS_PP_CENTERS)
         except Exception:
@@ -336,17 +340,170 @@ def score(rendered, src_gray, paths, nodes, height_mm=None, ss=2, src_h=None,
     jag = measure_jaggedness(rendered)
     xing = measure_self_intersections(paths)
     fidelity = measure_fidelity(rendered, src_gray)
+    return _assemble(rendered, paths, nodes, comps, gaps, fuse, jag, xing,
+                     fidelity, mm_per_px, ss)
 
+
+def score_layered(layers, src_gray, src_rgb, height_mm=None, ss=2, src_h=None):
+    """Hygiene for a multi-colour candidate: `layers` is a list of
+    (rendered bool raster, paths, colour) in stacking order.
+
+    Shape-level measurements run PER LAYER and are combined worst-case, never
+    averaged - one ragged layer must not hide behind three clean ones:
+      components / strays  summed (each layer's islands are distinct islands)
+      fusions              not measured (see below) - always 0
+      jaggedness           the worst layer
+      self-intersections   summed over all paths
+    Image-level measurements run on the UNION of the layers so they stay
+    comparable with the single-mask siblings on the same sheet:
+      gaps                 summed per layer - a hairline seam inside one
+                           colour. A seam BETWEEN two colours is not measured
+                           yet: on the union it counted every white design
+                           line between colours as a gap.
+      fidelity             greyscale edge-F1 on the union, the SAME definition
+                           every other candidate gets, because finalize()
+                           ranks fidelity relative to the best sibling and a
+                           different definition would not be comparable.
+    `fidelity_color` is reported alongside: edge-F1 against the source's
+    colour edges, which is what a recolourable file should be judged on and
+    what the greyscale number cannot see.
+    """
+    union = np.zeros_like(layers[0][0])
+    for r, _, _ in layers:
+        union |= r
+    all_paths = [p for _, ps, _ in layers for p in ps]
+    nodes = sum(len(segs) for segs in all_paths)
+
+    src_h = src_h or src_gray.shape[0]
+    mm_per_px = (height_mm / src_h) if height_mm else None
+    gap_px = max(1, int(round(0.12 / mm_per_px * ss))) if mm_per_px else 2 * ss
+
+    # 'Stray' is defined against the WHOLE artwork's ink, as it is for a
+    # single-mask candidate, not against each colour's own area - otherwise a
+    # small colour (a red chevron) would call its own real islands debris.
+    # ...and a small island that TOUCHES another colour's ink is not debris
+    # either: a chain link on a blue field, a letter on a banner. Only a small
+    # island sitting in open background is a stray, which is what the word
+    # means for a single-mask candidate too.
+    u_total = max(1, int(union.sum()))
+    per_c = [_layer_components(r, union, 0.002 * u_total) for r, _, _ in layers]
+    # Gap test per layer, against COLOUR: 'does the source under this sliver
+    # look like this layer's colour' - the luminance version cannot ask that
+    # for a yellow layer over a navy field.
+    per_g = [measure_gaps(r, _likeness(src_rgb, color), gap_px)
+             for r, _, color in layers]
+    per_j = [measure_jaggedness(r) for r, _, _ in layers]
+    comps = {'components': sum(c['components'] for c in per_c),
+             'strays': sum(c['strays'] for c in per_c),
+             'stray_area_frac': round(sum(c['stray_area_frac'] * int(r.sum()) / u_total
+                                          for c, (r, _, _) in zip(per_c, layers)), 4)}
+    gaps = {'gaps': sum(g['gaps'] for g in per_g),
+            'gap_area_px': sum(g['gap_area_px'] for g in per_g),
+            'design_gaps': sum(g['design_gaps'] for g in per_g)}
+    # Fusion - two source colours inside one ink component - is the defect a
+    # layered candidate exists to avoid: colours are separate layers by
+    # construction. Measuring it inside one colour layer only re-detects that
+    # layer's own shading, so it is not a penalty here; `fidelity_color`
+    # is the number that says whether the colour split matched the source.
+    fuse = {'fusions': 0, 'fused_area_frac': 0.0}
+    jag = max(per_j, key=lambda j: j['jaggedness_px'])
+    xing = measure_self_intersections(all_paths)
+    fidelity = measure_fidelity(union, src_gray)
+
+    out = _assemble(union, all_paths, nodes, comps, gaps, fuse, jag, xing,
+                    fidelity, mm_per_px, ss)
+    out['fidelity_color'] = round(measure_fidelity_color(layers, src_rgb), 3)
+    out['layer_count'] = len(layers)
+    return out
+
+
+def _layer_components(ink, union, cutoff_px):
+    """measure_components for one colour layer of a layered candidate: an
+    island is a stray only if it is under `cutoff_px` AND touches no ink of
+    any other layer (its 1px ring lies entirely in background)."""
+    total = int(ink.sum())
+    if total == 0:
+        return {'components': 0, 'strays': 0, 'stray_area_frac': 0.0}
+    n, lbl, stats, _ = cv2.connectedComponentsWithStats(ink.astype(np.uint8),
+                                                        connectivity=8)
+    others = union & ~ink
+    k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    strays, stray_area = 0, 0
+    for i in range(1, n):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area >= cutoff_px:
+            continue
+        x, y, w, h = (int(stats[i, c]) for c in
+                      (cv2.CC_STAT_LEFT, cv2.CC_STAT_TOP, cv2.CC_STAT_WIDTH,
+                       cv2.CC_STAT_HEIGHT))
+        sl = (slice(max(0, y - 1), y + h + 1), slice(max(0, x - 1), x + w + 1))
+        comp = (lbl[sl] == i).astype(np.uint8)
+        ring = (cv2.dilate(comp, k3) > 0) & (comp == 0)
+        if not others[sl][ring].any():
+            strays += 1
+            stray_area += area
+    return {'components': int(n - 1), 'strays': int(strays),
+            'stray_area_frac': float(stray_area / total)}
+
+
+def _likeness(src_rgb, color):
+    """A greyscale image that is bright where the source is close to `color`
+    in CIELAB and dark where it is far - so measure_gaps' 'does the source
+    look like ink here' question works for a coloured layer."""
+    lab = cv2.cvtColor(src_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    c = cv2.cvtColor(np.asarray(color, np.uint8).reshape(1, 1, 3),
+                     cv2.COLOR_RGB2LAB).astype(np.float32).reshape(3)
+    d = lab - c
+    d[..., 0] *= 100.0 / 255.0
+    de = np.linalg.norm(d, axis=2)
+    return np.clip(255.0 - 4.0 * de, 0, 255).astype(np.uint8)
+
+
+def measure_fidelity_color(layers, src_rgb, tol_frac=0.004):
+    """Edge-F1 between the source's COLOUR edges (Canny on each Lab channel,
+    OR-ed) and the boundaries of the composited layer map. Greyscale fidelity
+    cannot tell 'right shape, wrong colour split' from right; this can."""
+    if src_rgb is None:
+        return 0.0
+    ref = layers[0][0]
+    label_img = np.zeros(ref.shape, np.int32)
+    for i, (r, _, _) in enumerate(layers, 1):
+        label_img[r] = i
+    src = _match_shape(cv2.cvtColor(src_rgb, cv2.COLOR_RGB2LAB), ref)
+    src_edges = np.zeros(ref.shape, bool)
+    for ch in range(3):
+        g = cv2.GaussianBlur(src[..., ch], (3, 3), 0)
+        med = float(np.median(g))
+        src_edges |= cv2.Canny(g, int(max(0, 0.66 * med)), int(min(255, 1.33 * med))) > 0
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    lab8 = label_img.astype(np.uint8)
+    out_edges = (cv2.dilate(lab8, k) != cv2.erode(lab8, k))
+    if not src_edges.any() or not out_edges.any():
+        return 0.0
+    tol = max(2.0, tol_frac * float(np.hypot(*ref.shape)))
+    d_to_src = cv2.distanceTransform((~src_edges).astype(np.uint8), cv2.DIST_L2, 3)
+    d_to_out = cv2.distanceTransform((~out_edges).astype(np.uint8), cv2.DIST_L2, 3)
+    precision = float((d_to_src[out_edges] <= tol).mean())
+    recall = float((d_to_out[src_edges] <= tol).mean())
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def _assemble(rendered, paths, nodes, comps, gaps, fuse, jag, xing, fidelity,
+              mm_per_px, ss):
+    """Turn the measurements into penalties, a hygiene score and a headline.
+    Shared by score() and score_layered() so there is exactly one set of
+    weights."""
     # Jaggedness is measured on the supersampled raster; report in source px.
     jag_px = jag['jaggedness_px'] / ss
 
     path_len_mm = None
     nodes_per_mm = None
     if mm_per_px:
-        per = sum(cv2.arcLength(c, True) for c, in
-                  [(c,) for c in cv2.findContours(rendered.astype(np.uint8),
-                                                  cv2.RETR_LIST,
-                                                  cv2.CHAIN_APPROX_NONE)[0]])
+        contours, _ = cv2.findContours(rendered.astype(np.uint8), cv2.RETR_LIST,
+                                       cv2.CHAIN_APPROX_NONE)
+        per = sum(cv2.arcLength(c, True) for c in contours)
         path_len_mm = float(per / ss * mm_per_px)
         nodes_per_mm = float(nodes / path_len_mm) if path_len_mm > 0 else None
 

@@ -192,6 +192,16 @@ button:focus-visible, .dropzone:focus-visible{
   transition:width .3s ease;
 }
 
+/* ---------- live view (debug) ---------- */
+.live{display:flex; flex-direction:column; gap:var(--s3)}
+.live-head{display:flex; justify-content:space-between; align-items:center; gap:var(--s3); flex-wrap:wrap}
+.live-actions{display:flex; gap:var(--s2)}
+.live-grid{display:grid; grid-template-columns:repeat(auto-fill, minmax(150px, 1fr)); gap:var(--s3)}
+.live-tile{display:flex; flex-direction:column; gap:var(--s1); min-width:0}
+.live-tile img{width:100%; aspect-ratio:1; object-fit:contain; background:#fff; border:1px solid var(--surface-3); border-radius:4px}
+.live-tile .meta{font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.live-tile .step{color:var(--text-muted)}
+
 /* ---------- results ---------- */
 .results{display:flex; flex-direction:column; gap:var(--s5)}
 /* best_DESIGN.md 3.2: cards are separated by surface contrast, a hairline

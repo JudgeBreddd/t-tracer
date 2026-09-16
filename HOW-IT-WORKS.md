@@ -67,7 +67,9 @@ is under 2000 px, so the cap is a no-op on all prior calibration data.
 ### 2.2 The strategies
 
 Each is a pure function from RGB to a boolean mask. Adding one means adding a
-function and a dictionary entry.
+function and a dictionary entry. The one exception is `kmeans-layered`, which
+returns a list of `(mask, colour)` layers instead; it is registered in
+`LAYERED` and goes through the layered emission path described in 2.5.
 
 | Strategy | Mechanism |
 |---|---|
@@ -78,6 +80,7 @@ function and a dictionary entry.
 | `silhouette` | Everything that is not background, thresholded **inside the artwork only**. |
 | `nested` | Ink as a 2-colouring of the region containment tree. |
 | `composite` | `otsu` as the base, with `nested` allowed to remove ink from large solid fields. |
+| `kmeans-layered` | The `kmeans` colour split **kept all the way to the SVG**: one `<path>` per colour, each with its own fill. k chosen per image; anti-aliasing bands and near-twin colours folded away. Abstains on one-colour art. See 2.5. |
 
 Reachable via `--strategies` but off the default sheet: `plate`, `neural`,
 `edges`, `sauvola`, `inotsu`, `triotsu`. Each lost its place by failing to win
@@ -172,6 +175,16 @@ The SVG is deliberately minimal:
 - Dimensions emitted in **millimetres** when `--height-mm` is given, so the
   artwork arrives at physical size instead of needing to be scaled by hand.
 
+**The layered exception.** `kmeans-layered` is the one candidate that does not
+reduce to one fill. Every colour cluster becomes its own cleaned mask, goes
+through the *same* `clean_mask()` and `mask_to_paths()`, and is written by
+`paths_to_svg_layered()` as its own `<path>` with its own fill, lightest first
+and darkest last so the darker colour wins an anti-aliased boundary. A
+recolour is then an attribute edit, not a re-trace. It is a different kind of
+deliverable from the two-colour laser file, and the pick step decides which
+kind the job wants - which is why it sits on the slate as a sibling of
+`kmeans` rather than replacing it.
+
 ---
 
 ## 3. Scoring, and why you should not trust it too much
@@ -216,6 +229,17 @@ instead of a single winner. Before that, four good candidates were being logged
 as four losses on every image.
 
 ---
+
+**Scoring a layered candidate.** `hygiene.score_layered()` reuses every
+weight above unchanged; only the measurements differ. Components, jaggedness
+and self-intersections are measured per layer and combined worst-case, never
+averaged. A stray is a small island that touches *only background* - a chain
+link on a blue field is design. Gaps are measured per layer against a colour
+likeness map, not luminance. Fusion is not measured: colours are separate
+layers by construction. Fidelity stays the greyscale edge-F1 on the union of
+layers so `finalize()` can still compare it with its siblings; a second number,
+`fidelity_color`, reports edge-F1 against the source's colour edges, which is
+what a recolourable file should be judged on.
 
 ## 4. Determinism
 
@@ -307,6 +331,16 @@ actually *is* rather than trusted from the file — storing absolute paths once
 orphaned every past job the moment the work directory moved.
 
 ---
+
+**Live view (debug, off by default).** Settings → *Live view* shows every
+strategy's steps while a single image traces: about three frames a second,
+latest frame per step only, never queued. The engine's `on_step` hook stores a
+bare array reference; the server encodes a 480px PNG only when the browser
+polls, so a slow display sees fewer frames and the tracer never waits on it.
+Nothing touches disk unless *keep snapshots* is on and Save is chosen at the
+end; then they land in the job's own history folder, never the project tree.
+Batches that run on multiple worker processes have no live view - a callback
+cannot cross the process boundary.
 
 ## 7. Two rules about recording judgement
 
