@@ -22,12 +22,14 @@ import shutil
 import sys
 import threading
 import uuid
+from collections import OrderedDict
 from argparse import Namespace
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -65,6 +67,7 @@ WORK = _work_dir()
 sys.path.insert(0, str(ENGINE))
 import candidates as C                                   # noqa: E402
 import paths as _paths                                   # noqa: E402
+from burnmap import BurnMap                                 # noqa: E402
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff'}
 
@@ -109,7 +112,7 @@ TOKEN_HEADER = 'X-T-Tracer-Token'
 # param when it builds those URLs; it never appends it to a real fetch() call,
 # so the token does not end up in fetch's Referer/logs for anything else.
 TOKEN_QUERY_PARAM = 'tt_token'
-_TOKEN_QUERY_PATHS = re.compile(r'^/api/jobs/[^/]+/(preview|source)/')
+_TOKEN_QUERY_PATHS = re.compile(r'^(?:/api/jobs/[^/]+/(?:preview|source)/|/api/jobs/[^/]+/refine/[^/]+/(?:asset/|download$))')
 
 # Settings and the app's own pick log live beside the work directory, i.e.
 # under ~/.cache (or LOCALAPPDATA), NEVER inside the project. Same reason the
@@ -164,6 +167,12 @@ DEFAULT_SETTINGS = {
     'retention': 'forever', # item 7: 'forever' | '90d' | '30d'
     'live_view': False,    # debug: show each strategy's steps while tracing
     'live_keep': False,    # debug: retain every snapshot for save-or-trash
+    # Developer mode. Off for a normal install; on, the judging UI grows two
+    # controls that only make sense while TESTING the tracer rather than using
+    # it: exclude a run from the record, and a reason box on 'Nothing usable'.
+    # It gates the purge endpoints too, so a customer install cannot reach
+    # them at all even by hand-crafting a request.
+    'dev_mode': False,
 }
 
 
@@ -209,6 +218,19 @@ def read_jsonl(path: Path) -> list[dict]:
         if isinstance(row, dict) and row.get('image'):
             by_image[row['image']] = row
     return list(by_image.values())
+
+
+def active_rows(rows: list[dict]) -> list[dict]:
+    """Rows that still count, i.e. everything not tombstoned by dev mode.
+
+    An excluded row is written rather than withheld, and that is the point:
+    `read_jsonl` is last-row-wins per image, so appending {excluded: true}
+    also RETRACTS a verdict already recorded for that image - which is the
+    case this exists for ("I traced something I did not mean to, and it has
+    already logged that it failed"). Filtering here rather than in read_jsonl
+    keeps the retraction and its reason readable in the file.
+    """
+    return [r for r in rows if not r.get('excluded')]
 
 
 def summarise(rows: list[dict]) -> dict:
@@ -305,6 +327,15 @@ def cli_defaults(**over) -> Namespace:
 # --------------------------------------------------------------------------
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
+
+# Refinement is deliberately opt-in and bounded.  Each editor owns at most an
+# 800px raster plus compact region arrays; evicting the least recently used
+# editor keeps a batch from turning a long-lived desktop process into a cache.
+REFINE_MAX_STATES = 8
+REFINE_STATES: OrderedDict[tuple[str, str], BurnMap] = OrderedDict()
+REFINE_MAX_SNAPSHOTS = 256
+REFINE_SNAPSHOTS: OrderedDict[tuple[str, str], dict] = OrderedDict()
+REFINE_LOCK = threading.RLock()
 
 # Only ONE tracing batch runs at a time, process-wide.
 #
@@ -467,17 +498,29 @@ async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> str:
     true of nothing on their end and actively misleading about what to fix.
     """
     written = 0
+    oversized = False
     try:
         with dest.open('wb') as out:
             while chunk := await f.read(UPLOAD_CHUNK):
                 written += len(chunk)
                 if written > max_bytes:
-                    dest.unlink(missing_ok=True)
-                    return 'oversized'
+                    # Windows refuses to unlink an open file. Remember the
+                    # outcome and remove it only after the context manager has
+                    # closed the handle; otherwise an oversized upload is
+                    # mislabeled as a generic write error on the platform the
+                    # desktop app primarily ships on.
+                    oversized = True
+                    break
                 out.write(chunk)
     except Exception:                                      # noqa: BLE001
         dest.unlink(missing_ok=True)
         return 'error'
+    if oversized:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            return 'error'
+        return 'oversized'
     return 'ok'
 
 
@@ -495,13 +538,15 @@ async def create_job(files: list[UploadFile]):
         if Path(name).suffix.lower() not in IMAGE_EXTS:
             rejected.append(name)
             continue
-        # Stem collisions overwrite each other downstream (a known pipeline
-        # bug: "DC Insignia.jpg" and "DC Insignia.png" share an output folder).
-        # Disambiguate on the way in rather than losing one silently.
-        stem, suf, n = Path(name).stem, Path(name).suffix, 1
-        while (src / f'{stem}{suf}').exists():
+        # Stem collisions overwrite each other downstream even when extensions
+        # differ (``mark.jpg`` and ``mark.png`` share an output folder). Keep
+        # every accepted source stem unique, case-insensitively on every OS.
+        base_stem, suf, n = Path(name).stem, Path(name).suffix, 1
+        stem = base_stem
+        existing_stems = {p.stem.casefold() for p in src.iterdir() if p.is_file()}
+        while stem.casefold() in existing_stems:
             n += 1
-            stem = f'{Path(name).stem} ({n})'
+            stem = f'{base_stem} ({n})'
         dest = src / f'{stem}{suf}'
         result = await _save_upload(f, dest, MAX_UPLOAD_MB * 1024 * 1024)
         if result == 'oversized':
@@ -574,7 +619,7 @@ def _judged_stems() -> set[str]:
     judgement, and re-serving that image would ask the same question twice."""
     out = set()
     for f in (_paths.PICKS, APP_PICKS):
-        for row in read_jsonl(f):
+        for row in active_rows(read_jsonl(f)):
             image = row.get('image')
             if image:
                 out.add(Path(image).stem)
@@ -896,6 +941,146 @@ def source(job_id: str, fname: str):
     return FileResponse(p)
 
 
+# --------------------------------------------------------------------------
+# Optional Burn Map refinement.  This is a separate, human-reviewed rescue
+# path; the five default candidates and their saved picks are untouched.
+
+def _refine_source(job_id: str, stem: str) -> Path:
+    job = JOBS.get(job_id)
+    if not job or Path(stem).name != stem:
+        raise HTTPException(404, 'unknown image')
+    src_dir = Path(job.get('src_dir', ''))
+    try:
+        matches = [p for p in src_dir.iterdir() if p.is_file() and p.stem == stem]
+    except OSError:
+        matches = []
+    if len(matches) != 1:
+        raise HTTPException(404, 'unknown image')
+    return matches[0]
+
+
+def _refine_editor(job_id: str, stem: str) -> BurnMap:
+    source_path = _refine_source(job_id, stem)
+    key = (job_id, stem)
+    with REFINE_LOCK:
+        editor = REFINE_STATES.get(key)
+        if editor is None:
+            try:
+                editor = BurnMap(source_path, max_dim=800)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(422, f'could not prepare refinement: {exc}') from exc
+            saved = REFINE_SNAPSHOTS.get(key)
+            if saved is not None:
+                editor.restore(saved)
+                REFINE_SNAPSHOTS.move_to_end(key)
+            REFINE_STATES[key] = editor
+            while len(REFINE_STATES) > REFINE_MAX_STATES:
+                evicted_key, evicted = REFINE_STATES.popitem(last=False)
+                REFINE_SNAPSHOTS[evicted_key] = evicted.snapshot()
+                REFINE_SNAPSHOTS.move_to_end(evicted_key)
+                while len(REFINE_SNAPSHOTS) > REFINE_MAX_SNAPSHOTS:
+                    REFINE_SNAPSHOTS.popitem(last=False)
+        else:
+            REFINE_STATES.move_to_end(key)
+        return editor
+
+
+def _refine_payload(job_id: str, stem: str, editor: BurnMap) -> dict:
+    base = f'/api/jobs/{quote(job_id, safe="")}/refine/{quote(stem, safe="")}'
+    payload = editor.state()
+    payload['assets'] = {name: f'{base}/asset/{quote(name, safe="")}'
+                         for name in ('source.png', 'overlay.png', 'result.png', 'diff.png')}
+    payload['download'] = f'{base}/download'
+    return payload
+
+
+@app.get('/api/jobs/{job_id}/refine/{stem}')
+def refine_state(job_id: str, stem: str):
+    editor = _refine_editor(job_id, stem)
+    return _refine_payload(job_id, stem, editor)
+
+
+@app.get('/api/jobs/{job_id}/refine/{stem}/asset/{fname}')
+def refine_asset(job_id: str, stem: str, fname: str):
+    if fname not in {'source.png', 'overlay.png', 'result.png', 'diff.png'}:
+        raise HTTPException(404, 'not found')
+    editor = _refine_editor(job_id, stem)
+    data = editor.assets().get(fname)
+    if data is None:
+        raise HTTPException(404, 'not found')
+    return Response(content=data, media_type='image/png', headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/jobs/{job_id}/refine/{stem}/download')
+def refine_download(job_id: str, stem: str):
+    editor = _refine_editor(job_id, stem)
+    download_name = f'{stem}-corrected.svg'
+    ascii_name = re.sub(r'[^A-Za-z0-9._ -]', '_', download_name).replace('"', '_')
+    disposition = (f'attachment; filename="{ascii_name}"; '
+                   f"filename*=UTF-8''{quote(download_name, safe='')}")
+    return Response(content=editor.svg(), media_type='image/svg+xml',
+                    headers={'Content-Disposition': disposition,
+                             'Cache-Control': 'no-store'})
+
+
+class RefineActionReq(BaseModel):
+    region_id: int | None = None
+    colour_label: int | None = None
+    proposal_id: str | None = None
+    x: int | None = None
+    y: int | None = None
+
+
+@app.post('/api/jobs/{job_id}/refine/{stem}/action')
+def refine_action(job_id: str, stem: str, req: RefineActionReq):
+    editor = _refine_editor(job_id, stem)
+    try:
+        if req.region_id is not None:
+            editor.toggle(req.region_id)
+        elif req.x is not None and req.y is not None:
+            region_id = editor.region_at(req.x, req.y)
+            if region_id < 0:
+                raise KeyError('no editable region at that point')
+            editor.toggle(region_id)
+        elif req.colour_label is not None:
+            editor.toggle_group(req.colour_label)
+        elif req.proposal_id:
+            editor.apply_proposal(req.proposal_id)
+        else:
+            raise KeyError('one refinement action is required')
+    except KeyError as exc:
+        raise HTTPException(400, f'unknown refinement target: {exc}') from exc
+    with REFINE_LOCK:
+        key = (job_id, stem)
+        REFINE_SNAPSHOTS[key] = editor.snapshot()
+        REFINE_SNAPSHOTS.move_to_end(key)
+        while len(REFINE_SNAPSHOTS) > REFINE_MAX_SNAPSHOTS:
+            REFINE_SNAPSHOTS.popitem(last=False)
+    return _refine_payload(job_id, stem, editor)
+
+
+class RefineSaveReq(BaseModel):
+    dest: str
+
+
+@app.post('/api/jobs/{job_id}/refine/{stem}/save')
+def refine_save(job_id: str, stem: str, req: RefineSaveReq):
+    editor = _refine_editor(job_id, stem)
+    dest = Path(req.dest).expanduser()
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / f'{stem}-corrected.svg'
+        n = 1
+        while target.exists():
+            n += 1
+            target = dest / f'{stem}-corrected ({n}).svg'
+        target.write_bytes(editor.svg())
+    except OSError as exc:
+        raise HTTPException(400, f'Cannot write to {dest}: {exc}') from exc
+    write_settings({'dest': str(dest)})
+    return {'written': [target.name], 'dest': str(dest)}
+
+
 class SaveReq(BaseModel):
     dest: str
     picks: dict[str, str]          # image stem -> favourite strategy name
@@ -952,6 +1137,11 @@ def history():
 def forget_job(job_id: str):
     job = JOBS.pop(job_id, None)
     if job:
+        with REFINE_LOCK:
+            for key in [key for key in REFINE_STATES if key[0] == job_id]:
+                REFINE_STATES.pop(key, None)
+            for key in [key for key in REFINE_SNAPSHOTS if key[0] == job_id]:
+                REFINE_SNAPSHOTS.pop(key, None)
         shutil.rmtree(Path(job['out_dir']).parent, ignore_errors=True)
     return {'ok': True}
 
@@ -1004,6 +1194,11 @@ def _clean_jobs(job_ids: list[str]) -> int:
     freed = 0
     for job_id in job_ids:
         freed += _dir_size(WORK / job_id)
+        with REFINE_LOCK:
+            for key in [key for key in REFINE_STATES if key[0] == job_id]:
+                REFINE_STATES.pop(key, None)
+            for key in [key for key in REFINE_SNAPSHOTS if key[0] == job_id]:
+                REFINE_SNAPSHOTS.pop(key, None)
         shutil.rmtree(WORK / job_id, ignore_errors=True)
         JOBS.pop(job_id, None)
     return freed
@@ -1108,6 +1303,7 @@ class Settings(BaseModel):
     retention: str | None = None
     live_view: bool | None = None
     live_keep: bool | None = None
+    dev_mode: bool | None = None
 
 
 @app.get('/api/settings')
@@ -1142,6 +1338,8 @@ class JudgeRow(BaseModel):
     shippable_ranks: list[int] = []
     of: int = 0
     failed: bool = False
+    excluded: bool = False          # dev mode: record it, then discount it
+    note: str | None = None         # dev mode: why nothing here was usable
 
 
 @app.post('/api/jobs/{job_id}/judge')
@@ -1168,6 +1366,8 @@ def judge(job_id: str, rows: list[JudgeRow]):
                     'rank': (r.shippable_ranks[0]
                              if r.shippable_ranks and not r.failed else None),
                     'of': r.of,
+                    **({'excluded': True} if r.excluded else {}),
+                    **({'note': r.note.strip()} if (r.note or '').strip() else {}),
                     'source': role,
                     'origin': 'app',
                     'job': job_id,
@@ -1175,6 +1375,188 @@ def judge(job_id: str, rows: list[JudgeRow]):
     except OSError:
         return {'ok': False}            # never let logging break a save
     return {'ok': True, 'recorded': len(rows)}
+
+
+# --------------------------------------------------------------------------
+# Purge - developer mode only, and the only genuinely destructive thing in
+# this server.
+#
+# `exclude` is the soft form and should be the common one: it appends a
+# tombstone, the image drops out of the statistics and comes BACK into the
+# calibration queue, and the file still says what happened. Purge is the hard
+# requested behavior: the image "fully deletes out of the corpus,
+# picks.py, and anywhere else it exists in this project". There is no undo and
+# no recycle bin - `/api/purge/plan` exists so the exact list of paths can be
+# put in front of a human before the second click.
+#
+# Bounded by construction: every root it will touch is named in PURGE_ROOTS,
+# names are compared literally (never globbed, so a stem full of glob
+# metacharacters cannot widen the sweep), and a stem carrying a path separator
+# is rejected outright.
+# --------------------------------------------------------------------------
+
+def _purge_roots() -> list[Path]:
+    return [_paths.CANDIDATES, _paths.CORPUS, _paths.INTAKE,
+            _paths.RUNS, _paths.INBOX]
+
+
+def _check_stem(stem: str) -> str:
+    stem = (stem or '').strip()
+    if not stem or stem in ('.', '..') or '/' in stem or '\\' in stem:
+        raise HTTPException(400, 'bad stem')
+    return stem
+
+
+def _purge_plan(stem: str) -> dict:
+    """Everything a purge of `stem` would remove. Pure: touches nothing."""
+    stem = _check_stem(stem)
+    paths: list[dict] = []
+    seen: set[Path] = set()
+
+    def add(path: Path, what: str) -> None:
+        if path in seen or not path.exists():
+            return
+        seen.add(path)
+        paths.append({'path': str(path), 'what': what,
+                      'dir': path.is_dir()})
+
+    # 1. the job folders in the work directory
+    if WORK.is_dir():
+        for job_dir in sorted(WORK.iterdir()):
+            src, out = job_dir / 'in', job_dir / 'out'
+            hits = [f for f in src.iterdir()
+                    if f.is_file() and f.stem == stem] if src.is_dir() else []
+            outs = [d for d in out.iterdir()
+                    if d.name == stem] if out.is_dir() else []
+            if not hits and not outs:
+                continue
+            others = [f for f in src.iterdir()
+                      if f.is_file() and f.stem != stem] if src.is_dir() else []
+            if hits and not others:
+                # the whole job was this one image: the folder goes with it,
+                # otherwise History keeps an entry that can no longer open.
+                add(job_dir, 'job history')
+                continue
+            for f in hits:
+                add(f, 'job source')
+            for d in outs:
+                add(d, 'traced candidates')
+
+    # 2. the private tree - literal name comparison, no globbing
+    for root in _purge_roots():
+        if not root.is_dir():
+            continue
+        for cur, dirnames, filenames in _os.walk(root):
+            curp = Path(cur)
+            for d in list(dirnames):
+                if d == stem:
+                    add(curp / d, f'{root.name}/')
+                    dirnames.remove(d)      # do not descend into it twice
+            for f in filenames:
+                if Path(f).stem == stem:
+                    add(curp / f, f'{root.name}/')
+
+    rows = {}
+    for label, f in (('app', APP_PICKS), ('calibration', CALIB_PICKS)):
+        n = 0
+        if f.is_file():
+            try:
+                for line in f.read_text().splitlines():
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict) and Path(
+                            str(row.get('image', ''))).stem == stem:
+                        n += 1
+            except OSError:
+                pass
+        rows[label] = n
+
+    return {'stem': stem, 'paths': paths, 'rows': rows,
+            'total': len(paths) + rows['app'] + rows['calibration']}
+
+
+def _strip_rows(f: Path, stem: str) -> int:
+    """Rewrite a pick log without any row for `stem`. Returns rows removed.
+
+    Written to a sibling temp file and replaced atomically, so a crash
+    mid-write leaves the original log intact rather than a half file - this
+    is ground truth for the calibration corpus.
+    """
+    if not f.is_file():
+        return 0
+    try:
+        lines = f.read_text().splitlines(keepends=True)
+    except OSError:
+        return 0
+    keep, dropped = [], 0
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            keep.append(line)               # never discard what we cannot read
+            continue
+        if isinstance(row, dict) and Path(str(row.get('image', ''))).stem == stem:
+            dropped += 1
+        else:
+            keep.append(line)
+    if not dropped:
+        return 0
+    tmp = f.with_suffix(f.suffix + '.tmp')
+    try:
+        tmp.write_text(''.join(keep))
+        tmp.replace(f)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return 0
+    return dropped
+
+
+class PurgeReq(BaseModel):
+    stem: str
+
+
+def _require_dev() -> None:
+    if not load_settings().get('dev_mode'):
+        raise HTTPException(403, 'developer mode is off')
+
+
+@app.post('/api/purge/plan')
+def purge_plan(req: PurgeReq):
+    _require_dev()
+    return _purge_plan(req.stem)
+
+
+@app.post('/api/purge')
+def purge(req: PurgeReq):
+    """Delete every trace of one image. Irreversible, dev mode only."""
+    _require_dev()
+    plan = _purge_plan(req.stem)
+    removed, failed = [], []
+    for item in plan['paths']:
+        path = Path(item['path'])
+        try:
+            if item['dir']:
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            removed.append(item['path'])
+        except OSError as e:
+            failed.append(f'{path}: {e}')
+    # Do not erase the only record of an image when any file deletion failed.
+    # A partially successful purge can be retried from the retained rows; a
+    # stripped log plus a locked source file leaves the two stores disagreeing
+    # and destroys the calibration provenance the purge is meant to clean up.
+    rows = ({'app': _strip_rows(APP_PICKS, plan['stem']),
+             'calibration': _strip_rows(CALIB_PICKS, plan['stem'])}
+            if not failed else {'app': 0, 'calibration': 0})
+    # A purged job folder must leave the in-memory index too, or History keeps
+    # offering a job whose files are gone.
+    for job_id in [j for j in list(JOBS) if not (WORK / j).is_dir()]:
+        JOBS.pop(job_id, None)
+    return {'ok': not failed, 'stem': plan['stem'], 'removed': removed,
+            'rows': rows, 'failed': failed}
 
 
 @app.get('/api/stats')
@@ -1190,9 +1572,9 @@ def stats():
         'version': APP_VERSION,
         'calibration': {
             'available': CALIB_PICKS.is_file(),
-            **summarise(read_jsonl(CALIB_PICKS)),
+            **summarise(active_rows(read_jsonl(CALIB_PICKS))),
         },
-        'app': summarise(read_jsonl(APP_PICKS)),
+        'app': summarise(active_rows(read_jsonl(APP_PICKS))),
         'strategy_order': list(C.STRATEGIES),
     }
 
@@ -1209,7 +1591,7 @@ def stats_report():
     cfg = load_settings()
     if not cfg.get('share_stats'):
         raise HTTPException(403, 'Stats sharing is off. Turn it on first.')
-    a = summarise(read_jsonl(APP_PICKS))
+    a = summarise(active_rows(read_jsonl(APP_PICKS)))
     return {
         'report': 't-tracer usage',
         'version': APP_VERSION,

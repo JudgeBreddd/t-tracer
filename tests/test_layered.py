@@ -161,6 +161,33 @@ def test_layerlines_abstains_on_one_colour_art():
     assert not C.strat_layerlines(img).any()
 
 
+def test_fieldflip_is_exposed_as_an_optional_strategy():
+    assert C.OPTIONAL['fieldflip'] is C.strat_fieldflip
+    assert C.ALL_STRATEGIES['fieldflip'] is C.strat_fieldflip
+    assert 'fieldflip' in C.ALPHA_AWARE
+
+
+def test_fieldflip_inverts_only_inside_the_artwork_envelope():
+    img = _flat_logo()
+    flipped = C.strat_fieldflip(img)
+    envelope = C._silhouette_of(img)
+
+    assert flipped.dtype == bool and flipped.shape == img.shape[:2]
+    assert flipped.any(), 'the opposite polarity should retain the light field'
+    assert not flipped[~envelope].any(), 'the white frame must remain white'
+    # The blue/yellow interior is bare in layerlines and should become ink in
+    # the flipped interpretation, while the outside corner stays untouched.
+    c = img.shape[0] // 2
+    assert flipped[c, c]
+    assert not flipped[0, 0]
+
+
+def test_fieldflip_abstains_when_layerlines_has_no_colour_structure():
+    img = np.full((200, 200, 3), 255, np.uint8)
+    cv2.circle(img, (100, 100), 60, (0, 0, 0), -1)
+    assert not C.strat_fieldflip(img).any()
+
+
 def test_default_sheet_is_five():
     assert list(C.STRATEGIES) == ['otsu', 'bgdist', 'kmeans', 'composite', 'layerlines']
     assert 'silhouette' in C.OPTIONAL and 'kmeans-layered' in C.OPTIONAL

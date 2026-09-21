@@ -115,6 +115,11 @@
   <p id="summary" class="meta"></p>
   <div class="actionbar-right">
     <button id="collapseall" class="ghost" type="button">Collapse all</button>
+    <!-- Developer mode only; shown/hidden by refreshAction(). Records the
+         judgement for every card on screen WITHOUT writing any SVG, so a
+         calibration batch can be judged and closed without filling a folder
+         with images nobody wants. -->
+    <button id="savepicks" class="ghost" type="button" hidden>Save picks</button>
     <button id="save" class="primary" type="button" disabled>Save favourites</button>
   </div>
 </footer>
@@ -165,6 +170,13 @@
   </div>
 </div>
 
+<div id="refine-modal" class="refine-modal" hidden role="dialog" aria-modal="true" aria-labelledby="refine-title">
+  <div class="refine-box">
+    <div class="refine-head"><div><h2 id="refine-title">Fix interpretation</h2><p id="refine-sub" class="meta"></p></div><button id="refine-close" class="close" type="button" aria-label="Close">&times;</button></div>
+    <div id="refine-body" class="refine-body"><p class="meta">Preparing the optional editor&hellip;</p></div>
+  </div>
+</div>
+
 <!-- Full-size candidate viewer. The 150px tile is enough to rank a slate at a
      glance and not enough to judge whether a hairline survived, which is the
      actual decision. Shows the candidate beside the ORIGINAL rather than alone,
@@ -175,8 +187,6 @@
     <span id="v-title" class="v-title"></span>
     <span id="v-score" class="v-score"></span>
     <span class="v-spacer"></span>
-    <button id="v-pick" class="ghost" type="button">Mark shippable</button>
-    <button id="v-star" class="ghost" type="button">Star this one</button>
     <button id="v-close" class="close" type="button" aria-label="Close">&times;</button>
   </div>
   <div class="viewer-body">
@@ -193,6 +203,14 @@
     <button id="v-prev" class="ghost" type="button">&larr; Previous</button>
     <span id="v-pos" class="meta"></span>
     <button id="v-next" class="ghost" type="button">Next &rarr;</button>
+    <!-- Judging controls sit beside the navigation, not in the top bar: the
+         hand is already on Previous/Next, so marking and moving are one
+         short reach instead of a trip across the screen every candidate. -->
+    <span class="v-sep" aria-hidden="true"></span>
+    <button id="v-pick" class="ghost" type="button">Mark shippable</button>
+    <button id="v-star" class="ghost" type="button">Star this one</button>
+    <span class="v-sep" aria-hidden="true"></span>
+    <button id="v-nextset" class="ghost" type="button">Next set &rarr;&rarr;</button>
   </div>
 </div>
 

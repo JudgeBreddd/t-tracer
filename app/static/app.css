@@ -483,6 +483,7 @@ table.stat th.num,table.stat td.num{
 .v-title{font-size:13px; color:var(--text-primary); font-weight:500}
 .v-score{font-size:11px; color:var(--text-muted); font-variant-numeric:tabular-nums}
 .v-spacer{flex:1}
+.v-sep{width:1px; align-self:stretch; background:var(--border-subtle); margin:0 var(--s2)}
 #v-pick.on,#v-star.on{color:var(--accent-red-bright); border-color:var(--accent-red-deep)}
 
 .viewer-body{
@@ -505,7 +506,47 @@ table.stat th.num,table.stat td.num{
 }
 .viewer-foot{
   display:flex; align-items:center; justify-content:center; gap:var(--s4);
+  flex-wrap:wrap;
   padding:var(--s3); background:var(--surface-1);
   border-top:1px solid var(--border-subtle);
 }
 @media (max-width:900px){ .viewer-body{flex-direction:column} }
+
+/* ---------- developer mode ----------
+ * The two per-card dev controls reuse .nothing so they sit in the head bar at
+ * the same weight as "Nothing usable". .danger is the only red-filled button
+ * in the app on purpose: it is the one action with no undo. */
+.nothing.dev{color:var(--text-muted); border-style:dashed}
+.nothing.dev:hover{color:var(--text-primary)}
+.nothing.dev.danger:hover{color:var(--accent-red-bright); border-color:var(--accent-red-bright)}
+.primary.danger{background:var(--accent-red-deep); border-color:var(--accent-red-bright)}
+textarea.devnote{
+  width:100%; margin-top:12px; padding:8px 10px; resize:vertical;
+  background:var(--surface-2, rgba(255,255,255,.04));
+  border:1px solid var(--border-medium); color:var(--text-primary);
+  font:inherit; font-size:12px; line-height:1.5; border-radius:4px;
+}
+textarea.devnote:focus{outline:none; border-color:var(--accent-red-bright)}
+.purgelist{
+  margin:12px 0 0; padding:8px 10px; max-height:38vh; overflow-y:auto;
+  list-style:none; border:1px solid var(--border-medium); border-radius:4px;
+  font-size:11px; color:var(--text-secondary); line-height:1.7;
+  word-break:break-all;
+}
+.purgelist .what{
+  display:inline-block; min-width:118px; color:var(--text-muted);
+}
+
+/* Optional connected-region interpretation editor. It is intentionally a
+   modal so the normal five-candidate workflow remains unchanged. */
+.refine-modal{position:fixed;inset:0;z-index:30;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.72)}
+.refine-modal[hidden]{display:none}
+.refine-box{width:min(1180px,96vw);max-height:94vh;overflow:auto;background:var(--surface-1);border:1px solid var(--border-medium);border-radius:8px;box-shadow:0 18px 70px rgba(0,0,0,.5)}
+.refine-head{display:flex;justify-content:space-between;align-items:flex-start;padding:16px 18px;border-bottom:1px solid var(--border-subtle)}
+.refine-head h2{margin:0 0 4px;font-size:17px}.refine-head p{margin:0}
+.refine-body{padding:16px;display:grid;grid-template-columns:minmax(420px,1fr) 300px;gap:14px}
+.refine-plates{display:grid;grid-template-columns:1fr 1fr;gap:10px}.refine-plate{margin:0;background:var(--surface-2);border:1px solid var(--border-subtle);border-radius:5px;overflow:hidden}.refine-plate figcaption{padding:6px 8px;color:var(--text-muted);font-size:11px}.refine-plate img{display:block;width:100%;background:#fff}
+.refine-plate img.refine-clickable{cursor:crosshair}
+.refine-controls{min-width:0}.refine-controls h3{margin:0 0 7px;font-size:12px;color:var(--text-secondary)}.refine-controls section{margin-bottom:16px}.refine-controls button{width:100%;margin:4px 0;text-align:left}.refine-controls .refine-row{display:flex;gap:6px}.refine-controls .refine-row button{width:auto;flex:1}.refine-list{max-height:220px;overflow:auto;border-top:1px solid var(--border-subtle)}.refine-list button{font-size:11px;padding:6px 7px}
+.refine-notice{padding:8px 9px;margin-bottom:12px;background:var(--surface-2);border-left:3px solid var(--accent-yellow);font-size:12px;line-height:1.4;color:var(--text-secondary)}
+@media(max-width:900px){.refine-body{grid-template-columns:1fr}.refine-plates{grid-template-columns:1fr 1fr}}

@@ -544,6 +544,55 @@ def strat_layerlines(rgb, line_frac=0.00125, fill_L=40.0, protect_white=True,
     return lines | fill
 
 
+def strat_fieldflip(rgb, alpha=None, lab_tol=14.0, **kw):
+    """The artwork-aware inverse of :func:`strat_layerlines`.
+
+    ``--invert`` is deliberately not used here: it inverts the whole canvas,
+    which turns a white source field into a giant black rectangle.  A Field
+    Flip inverts only the detected artwork envelope, leaving the frame white.
+    This is a second interpretation of the same colour structure, useful when
+    the operator knows the field/foreground polarity is opposite to the
+    darker-is-ink reading used by ``layerlines``.
+
+    The envelope comes from alpha when the source has meaningful transparency,
+    otherwise from Lab distance to the border background.  The current
+    layerlines result supplies the structural mask; keeping that mechanism
+    unchanged makes this candidate a reversible polarity experiment rather
+    than another luminance threshold.  A one-colour image has no meaningful
+    opposite interpretation and therefore abstains.
+
+    This function returns a single boolean mask like every non-layered
+    strategy.  The driver clips the cleaned result to the same envelope too,
+    because morphological cleanup is allowed to grow a mask by a pixel or two.
+    """
+    envelope = _silhouette_of(rgb, alpha, lab_tol)
+    if int(envelope.sum()) < 16:
+        return np.zeros(envelope.shape, dtype=bool)
+
+    # When both candidates are requested in one run, reuse the expensive
+    # colour segmentation that layerlines already computed.
+    base = _memo('layerlines', strat_layerlines, rgb, **kw)
+    if not base.any():
+        return np.zeros(envelope.shape, dtype=bool)
+
+    # Preserve a narrow inner rim around the artwork. Without it, flipping a
+    # dark outline makes the outside edge disappear entirely; the operator
+    # would get a floating field instead of a recognisable mark. Keep only the
+    # inside half of the ring so the frame remains white by construction.
+    ring_px = max(1, int(round(0.00125 * max(rgb.shape[:2]))))
+    ring_ker = cv2.getStructuringElement(cv2.MORPH_ELLIPSE,
+                                         (2 * ring_px + 1,) * 2)
+    ring = (cv2.morphologyEx(envelope.astype(np.uint8), cv2.MORPH_GRADIENT,
+                             ring_ker) > 0) & envelope
+
+    # True means black/ink. Flip only inside artwork; the outside is always
+    # false (white) even when the source field occupies most of the canvas.
+    opposite = envelope & ~base
+    if int(opposite.sum()) < 16:
+        return np.zeros(envelope.shape, dtype=bool)
+    return opposite | ring
+
+
 def _keep_white_channels(lines, fill, line_px):
     """Stop the outline stroke from closing a bare channel narrower than
     itself.
@@ -1871,7 +1920,8 @@ OPTIONAL = {'silhouette': strat_silhouette, 'keyline': strat_keyline,
             'kmeans-layered': strat_kmeans_layered,
             'edges': strat_edges, 'sauvola': strat_sauvola,
             'neural': strat_neural, 'plate': strat_plate,
-            'inotsu': strat_inotsu, 'triotsu': strat_triotsu}
+            'inotsu': strat_inotsu, 'triotsu': strat_triotsu,
+            'fieldflip': strat_fieldflip}
 
 # Strategies that return LAYERS - a list of (bool mask, (r, g, b)) - instead of
 # one boolean mask. They go through `_emit_layered`, not the single-mask path.
@@ -1888,7 +1938,7 @@ ALL_STRATEGIES = {**STRATEGIES, **OPTIONAL}
 # identifies the background region exactly, where the BFS currently infers it
 # from whichever region owns the most border pixels.
 ALPHA_AWARE = {'silhouette', 'linework', 'plate', 'inotsu', 'triotsu', 'keyline',
-               'keyfill', 'keyflip'}
+               'keyfill', 'keyflip', 'fieldflip'}
 
 
 # ---------------------------------------------------------------------------
@@ -2387,6 +2437,11 @@ def _run_strategies(names, rgb, alpha, src_gray, args, out_dir, results,
         mask = clean_mask(mask, src_gray, args.close, args.open, args.min_area_frac)
         if getattr(args, 'min_island', 0):
             mask = _grow_counters(mask, args.min_island)
+        # Field Flip is an artwork-local polarity change. Cleanup is allowed
+        # to close a hairline and min-island can grow counters, but neither is
+        # allowed to turn the white frame into ink.
+        if name == 'fieldflip':
+            mask &= _silhouette_of(rgb, alpha)
         if on_step:
             on_step(name, 'clean', mask)
 
