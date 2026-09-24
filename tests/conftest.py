@@ -37,4 +37,6 @@ def server(tmp_path, monkeypatch):
     monkeypatch.setattr(server_module, 'SETTINGS_FILE', work.parent / 'settings.json')
     monkeypatch.setattr(server_module, 'APP_PICKS', work.parent / 'app-picks.jsonl')
     monkeypatch.setattr(server_module, 'JOBS', {})
+    monkeypatch.setattr(server_module, 'REFINE_STATES', server_module.OrderedDict())
+    monkeypatch.setattr(server_module, 'REFINE_SNAPSHOTS', server_module.OrderedDict())
     return server_module

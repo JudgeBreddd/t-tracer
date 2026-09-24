@@ -57,9 +57,10 @@ RUNS = PRIVATE / 'runs'                  # per-batch output, the churn
 STAGES = PRIVATE / 'stages'
 DELIVERABLES = STAGES / '06_deliverables'
 INBOX = PRIVATE / 'inbox'
+INTAKE = PRIVATE / 'new to test'         # calibration queue: judged once, then done
 NOTES = PRIVATE / 'notes'                # HANDOFF.md, the fix list, working notes
 
 __all__ = [
     'ENGINE', 'PROJECT', 'PRIVATE', 'CORPUS', 'CANDIDATES', 'PICKS',
-    'RUNS', 'STAGES', 'DELIVERABLES', 'INBOX', 'NOTES',
+    'RUNS', 'STAGES', 'DELIVERABLES', 'INBOX', 'INTAKE', 'NOTES',
 ]

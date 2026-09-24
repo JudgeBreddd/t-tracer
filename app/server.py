@@ -22,12 +22,14 @@ import shutil
 import sys
 import threading
 import uuid
+from collections import OrderedDict
 from argparse import Namespace
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -65,6 +67,7 @@ WORK = _work_dir()
 sys.path.insert(0, str(ENGINE))
 import candidates as C                                   # noqa: E402
 import paths as _paths                                   # noqa: E402
+from burnmap import BurnMap                                 # noqa: E402
 
 IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff'}
 
@@ -109,7 +112,7 @@ TOKEN_HEADER = 'X-T-Tracer-Token'
 # param when it builds those URLs; it never appends it to a real fetch() call,
 # so the token does not end up in fetch's Referer/logs for anything else.
 TOKEN_QUERY_PARAM = 'tt_token'
-_TOKEN_QUERY_PATHS = re.compile(r'^/api/jobs/[^/]+/(preview|source)/')
+_TOKEN_QUERY_PATHS = re.compile(r'^(?:/api/jobs/[^/]+/(?:preview|source)/|/api/jobs/[^/]+/refine/[^/]+/(?:asset/|download$))')
 
 # Settings and the app's own pick log live beside the work directory, i.e.
 # under ~/.cache (or LOCALAPPDATA), NEVER inside the project. Same reason the
@@ -162,6 +165,14 @@ DEFAULT_SETTINGS = {
     'auto_update': False,  # item 3.5. Off by default; Windows-only regardless
                             # of this value (server enforces it, not just the UI).
     'retention': 'forever', # item 7: 'forever' | '90d' | '30d'
+    'live_view': False,    # debug: show each strategy's steps while tracing
+    'live_keep': False,    # debug: retain every snapshot for save-or-trash
+    # Developer mode. Off for a normal install; on, the judging UI grows two
+    # controls that only make sense while TESTING the tracer rather than using
+    # it: exclude a run from the record, and a reason box on 'Nothing usable'.
+    # It gates the purge endpoints too, so a customer install cannot reach
+    # them at all even by hand-crafting a request.
+    'dev_mode': False,
 }
 
 
@@ -207,6 +218,19 @@ def read_jsonl(path: Path) -> list[dict]:
         if isinstance(row, dict) and row.get('image'):
             by_image[row['image']] = row
     return list(by_image.values())
+
+
+def active_rows(rows: list[dict]) -> list[dict]:
+    """Rows that still count, i.e. everything not tombstoned by dev mode.
+
+    An excluded row is written rather than withheld, and that is the point:
+    `read_jsonl` is last-row-wins per image, so appending {excluded: true}
+    also RETRACTS a verdict already recorded for that image - which is the
+    case this exists for ("I traced something I did not mean to, and it has
+    already logged that it failed"). Filtering here rather than in read_jsonl
+    keeps the retraction and its reason readable in the file.
+    """
+    return [r for r in rows if not r.get('excluded')]
 
 
 def summarise(rows: list[dict]) -> dict:
@@ -275,13 +299,15 @@ def summarise(rows: list[dict]) -> dict:
 def cli_defaults(**over) -> Namespace:
     """Exactly the argparse defaults from candidates.py, overridable.
 
-    Kept in one place so a change to the CLI's defaults cannot silently leave
-    the app tracing with stale settings.
+    Taken FROM the CLI's own parser, not re-typed: the hand-written copy this
+    replaced had drifted (it lacked min_dim, min_island and four others and
+    only worked because run_one reads those with getattr). A default added
+    to the CLI now reaches the app the moment it exists.
     """
-    base = dict(only=None, strategies=None, invert=False, scale=6,
-                smoothing=3.0, tol=0.6, close=2, open=0, min_area_frac=0.0004,
-                height_mm=32.0, raster_ss=2, jobs=1, bg=False, max_dim=2048,
-                work_dim=C.WORK_DIM_DEFAULT)
+    base = vars(C.build_parser().parse_args([]))
+    if base.get('height_mm', 0) <= 0:              # main() does the same
+        base['height_mm'] = None
+    base['jobs'] = 1
     base.update(over)
     return Namespace(**base)
 
@@ -301,6 +327,15 @@ def cli_defaults(**over) -> Namespace:
 # --------------------------------------------------------------------------
 JOBS: dict[str, dict] = {}
 LOCK = threading.Lock()
+
+# Refinement is deliberately opt-in and bounded.  Each editor owns at most an
+# 800px raster plus compact region arrays; evicting the least recently used
+# editor keeps a batch from turning a long-lived desktop process into a cache.
+REFINE_MAX_STATES = 8
+REFINE_STATES: OrderedDict[tuple[str, str], BurnMap] = OrderedDict()
+REFINE_MAX_SNAPSHOTS = 256
+REFINE_SNAPSHOTS: OrderedDict[tuple[str, str], dict] = OrderedDict()
+REFINE_LOCK = threading.RLock()
 
 # Only ONE tracing batch runs at a time, process-wide.
 #
@@ -359,10 +394,13 @@ def load_jobs() -> None:
         JOBS[job['id']] = job
 
 
-def _trace_one(img_path: str, out_root: str) -> dict:
-    """Worker body. Top level so ProcessPoolExecutor can pickle it."""
+def _trace_one(img_path: str, out_root: str, on_step=None) -> dict:
+    """Worker body. Top level so ProcessPoolExecutor can pickle it. `on_step`
+    is only ever passed on the in-process path - a callback cannot cross a
+    process boundary, so the multi-worker path traces without a live view."""
     import candidates as _C
-    return _C.run_one(Path(img_path), Path(out_root), cli_defaults())
+    args = cli_defaults(on_step=on_step) if on_step else cli_defaults()
+    return _C.run_one(Path(img_path), Path(out_root), args)
 
 
 def _run_job(job_id: str) -> None:
@@ -392,22 +430,30 @@ def _run_job_inner(job_id: str) -> None:
                                      initializer=C._worker_init) as ex:
                 futs = {ex.submit(_trace_one, str(p), str(out_dir)): p
                         for p in images}
-                for f in futs:
-                    pass
-                for f in list(futs):
+                # Completion order, not submission order: `done` used to be
+                # gated on whichever image was submitted FIRST finishing.
+                for f in as_completed(futs):
+                    err = None
                     try:
                         f.result()
                     except Exception as e:
-                        job['errors'].append(f'{futs[f].name}: {e}')
+                        err = f'{futs[f].name}: {e}'
                     with LOCK:
+                        if err:
+                            job['errors'].append(err)
                         job['done'] += 1
         else:
+            live = LIVE.get(job_id)
             for p in images:
+                err = None
                 try:
-                    _trace_one(str(p), str(out_dir))
+                    _trace_one(str(p), str(out_dir),
+                               on_step=live.observer(p.stem) if live else None)
                 except Exception as e:
-                    job['errors'].append(f'{p.name}: {e}')
+                    err = f'{p.name}: {e}'
                 with LOCK:
+                    if err:
+                        job['errors'].append(err)
                     job['done'] += 1
         job['status'] = 'ready'
     except Exception as e:                                # noqa: BLE001
@@ -452,17 +498,29 @@ async def _save_upload(f: UploadFile, dest: Path, max_bytes: int) -> str:
     true of nothing on their end and actively misleading about what to fix.
     """
     written = 0
+    oversized = False
     try:
         with dest.open('wb') as out:
             while chunk := await f.read(UPLOAD_CHUNK):
                 written += len(chunk)
                 if written > max_bytes:
-                    dest.unlink(missing_ok=True)
-                    return 'oversized'
+                    # Windows refuses to unlink an open file. Remember the
+                    # outcome and remove it only after the context manager has
+                    # closed the handle; otherwise an oversized upload is
+                    # mislabeled as a generic write error on the platform the
+                    # desktop app primarily ships on.
+                    oversized = True
+                    break
                 out.write(chunk)
     except Exception:                                      # noqa: BLE001
         dest.unlink(missing_ok=True)
         return 'error'
+    if oversized:
+        try:
+            dest.unlink(missing_ok=True)
+        except OSError:
+            return 'error'
+        return 'oversized'
     return 'ok'
 
 
@@ -480,13 +538,15 @@ async def create_job(files: list[UploadFile]):
         if Path(name).suffix.lower() not in IMAGE_EXTS:
             rejected.append(name)
             continue
-        # Stem collisions overwrite each other downstream (a known pipeline
-        # bug: "DC Insignia.jpg" and "DC Insignia.png" share an output folder).
-        # Disambiguate on the way in rather than losing one silently.
-        stem, suf, n = Path(name).stem, Path(name).suffix, 1
-        while (src / f'{stem}{suf}').exists():
+        # Stem collisions overwrite each other downstream even when extensions
+        # differ (``mark.jpg`` and ``mark.png`` share an output folder). Keep
+        # every accepted source stem unique, case-insensitively on every OS.
+        base_stem, suf, n = Path(name).stem, Path(name).suffix, 1
+        stem = base_stem
+        existing_stems = {p.stem.casefold() for p in src.iterdir() if p.is_file()}
+        while stem.casefold() in existing_stems:
             n += 1
-            stem = f'{Path(name).stem} ({n})'
+            stem = f'{base_stem} ({n})'
         dest = src / f'{stem}{suf}'
         result = await _save_upload(f, dest, MAX_UPLOAD_MB * 1024 * 1024)
         if result == 'oversized':
@@ -513,16 +573,287 @@ async def create_job(files: list[UploadFile]):
                           + ', '.join(failed))
         raise HTTPException(400, 'No usable images. ' + '; '.join(detail))
 
+    return _start_job(job_id, src, out, accepted, rejected, oversized, failed)
+
+
+def _start_job(job_id, src, out, accepted, rejected=(), oversized=(), failed=()):
+    """Register a job whose source images are already on disk and trace it.
+    Shared by the upload route and the calibration intake route so both
+    produce an identical job record."""
     from datetime import datetime
     JOBS[job_id] = {'id': job_id, 'status': 'queued', 'done': 0,
                     'total': len(accepted), 'src_dir': str(src),
-                    'out_dir': str(out), 'errors': [], 'rejected': rejected,
+                    'out_dir': str(out), 'errors': [], 'rejected': list(rejected),
                     'created': datetime.now().isoformat(timespec='seconds'),
-                    'names': accepted, 'oversized': oversized, 'failed': failed}
+                    'names': accepted, 'oversized': list(oversized),
+                    'failed': list(failed)}
     save_job(JOBS[job_id])
+    st = load_settings()
+    if st.get('live_view'):
+        LIVE[job_id] = LiveView(keep=bool(st.get('live_keep')))
     threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
-    return {'job_id': job_id, 'accepted': accepted, 'rejected': rejected,
-            'oversized': oversized, 'failed': failed}
+    return {'job_id': job_id, 'accepted': accepted, 'rejected': list(rejected),
+            'oversized': list(oversized), 'failed': list(failed)}
+
+
+# --------------------------------------------------------------------------
+# Calibration intake.
+#
+# `_private/new to test/` is a queue of artwork waiting to be judged, and the
+# reason it needs code rather than a drag-and-drop is that NOTHING TRACKED
+# WHAT HAD ALREADY BEEN RUN. Measured 2026-09-15: 282 images, 111 of them
+# already judged, 41 duplicate stems - so pointing a batch at the folder
+# re-traced the same judged images over and over and produced no new
+# calibration data. Tyler, in those words: "he kept running the same 50 over
+# and over."
+#
+# So the queue is derived, never stored: an image is DONE when its stem
+# appears in either picks file, and IN FLIGHT when it is already the source
+# of a job in the work directory. Nothing to keep in sync, nothing to reset,
+# and a judgement made in the app removes it from the queue by itself.
+# --------------------------------------------------------------------------
+
+def _judged_stems() -> set[str]:
+    """Stems that already carry a verdict, from the calibration log and the
+    app's own. A row with pick None counts: 'nothing here is shippable' is a
+    judgement, and re-serving that image would ask the same question twice."""
+    out = set()
+    for f in (_paths.PICKS, APP_PICKS):
+        for row in active_rows(read_jsonl(f)):
+            image = row.get('image')
+            if image:
+                out.add(Path(image).stem)
+    return out
+
+
+def _in_flight_stems() -> set[str]:
+    """Stems already traced into a job and waiting on a verdict, so a second
+    'trace the next ten' does not hand back the ten now on screen."""
+    out = set()
+    for job in JOBS.values():
+        try:
+            src = Path(job.get('src_dir', ''))
+            if src.is_dir():
+                out.update(p.stem for p in src.iterdir() if p.is_file())
+        except OSError:
+            continue
+    return out
+
+
+def _intake_pool() -> tuple[list[Path], dict]:
+    """Unjudged intake images, one per stem, oldest-name-first for a stable
+    order. Returns (files, counts)."""
+    folder = _paths.INTAKE
+    counts = {'total': 0, 'judged': 0, 'in_flight': 0, 'remaining': 0,
+              'folder': str(folder), 'exists': folder.is_dir()}
+    if not folder.is_dir():
+        return [], counts
+    try:
+        files = sorted((p for p in folder.iterdir()
+                        if p.is_file() and p.suffix.lower() in IMAGE_EXTS),
+                       key=lambda p: p.name.lower())
+    except OSError:
+        return [], counts
+    judged, flight = _judged_stems(), _in_flight_stems()
+    pool, seen = [], set()
+    for p in files:
+        counts['total'] += 1
+        if p.stem in judged:
+            counts['judged'] += 1
+            continue
+        if p.stem in flight:
+            counts['in_flight'] += 1
+            continue
+        if p.stem in seen:            # same artwork twice under two extensions
+            continue
+        seen.add(p.stem)
+        pool.append(p)
+    counts['remaining'] = len(pool)
+    return pool, counts
+
+
+@app.get('/api/intake')
+def intake_status():
+    _, counts = _intake_pool()
+    return counts
+
+
+class IntakeReq(BaseModel):
+    count: int = 10
+
+
+@app.post('/api/intake/next')
+def intake_next(req: IntakeReq):
+    """Copy the next N unjudged intake images into a fresh job and trace it.
+
+    The files are COPIED, never moved: the intake folder is the only place
+    some of this artwork exists, and a job's work directory is disposable
+    history that the retention setting is allowed to delete.
+    """
+    n = max(1, min(50, int(req.count)))
+    pool, counts = _intake_pool()
+    if not counts['exists']:
+        raise HTTPException(404, f"No intake folder at {counts['folder']}")
+    if not pool:
+        raise HTTPException(400, 'Nothing left to judge: every intake image is '
+                                 'already judged or already in a job.')
+    job_id = uuid.uuid4().hex[:12]
+    src, out = WORK / job_id / 'in', WORK / job_id / 'out'
+    accepted, failed = [], []
+    try:
+        src.mkdir(parents=True, exist_ok=True)
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise HTTPException(507, f'could not create the job folder: {e}')
+    for p in pool[:n]:
+        try:
+            shutil.copy2(p, src / p.name)
+            accepted.append(p.name)
+        except OSError:
+            failed.append(p.name)
+    if not accepted:
+        shutil.rmtree(WORK / job_id, ignore_errors=True)
+        raise HTTPException(507, 'Could not copy any intake image - check disk space.')
+    res = _start_job(job_id, src, out, accepted, failed=failed)
+    res['remaining'] = counts['remaining'] - len(accepted)
+    return res
+
+
+# --------------------------------------------------------------------------
+# Live view (debug, off by default): watch each strategy's steps while a job
+# traces. Decided 2026-09-14, see _intake/kmeans-layered-emission-sketch.md.
+#
+#   * SEND-LATEST, NO QUEUE. The engine's per-step callback stores a bare
+#     reference to the step's array under (strategy, step) - a dict write,
+#     nothing encoded, nothing blocked. A newer frame for the same step
+#     replaces the older one. If the browser is slow it sees fewer frames;
+#     the tracer never waits on the display.
+#   * The browser polls at ~3/s and the ENCODE happens here, at poll time,
+#     downscaled to LIVE_PX on the long edge - so the cost of showing a frame
+#     is paid by the request, never by the pipeline, and only for frames
+#     that changed since the last poll (seq numbers).
+#   * Nothing is written to disk unless `keep` is on AND the user chooses
+#     Save afterwards; then the retained frames land in the job's own work
+#     folder (never the synced project tree). Retained frames are held in
+#     memory at LIVE_PX, so keeping is cheap and discard is free.
+#   * In-process path only: a callback cannot cross the ProcessPoolExecutor
+#     boundary, so a multi-image batch on a multi-worker machine has no live
+#     view. The daily case - one image at a time - is the in-process path.
+# --------------------------------------------------------------------------
+LIVE_PX = 480
+LIVE: dict[str, 'LiveView'] = {}
+
+
+def _live_encode(image) -> bytes:
+    """Any step output -> small PNG bytes. bool mask, HxWx3 RGB, or a list of
+    (mask, rgb) layers as the engine's layered strategies emit them."""
+    import numpy as np
+    import cv2
+    if isinstance(image, list):
+        if not image:
+            return b''
+        h, w = image[0][0].shape[:2]
+        out = np.full((h, w, 3), 255, np.uint8)
+        for m, color in image:
+            out[m] = color
+        image = out
+    arr = np.asarray(image)
+    if arr.dtype == bool:
+        arr = (~arr * 255).astype(np.uint8)
+    elif arr.ndim == 3:
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    h, w = arr.shape[:2]
+    s = LIVE_PX / max(h, w)
+    if s < 1.0:
+        arr = cv2.resize(arr, (max(1, int(w * s)), max(1, int(h * s))),
+                         interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode('.png', arr)
+    return buf.tobytes() if ok else b''
+
+
+class LiveView:
+    def __init__(self, keep: bool = False):
+        self.keep = keep
+        self.seq = 0
+        self.latest: dict[tuple, tuple] = {}     # (stem, strategy, step) -> (seq, image)
+        self.encoded: dict[tuple, tuple] = {}    # (stem, strategy, step) -> (seq, png)
+        self.retained: list[tuple] = []          # (stem, strategy, step, seq, png)
+        self.lock = threading.Lock()
+
+    def observer(self, stem: str):
+        def on_step(strategy, step, image):
+            with self.lock:
+                self.seq += 1
+                self.latest[(stem, strategy, step)] = (self.seq, image)
+                if self.keep:
+                    # Encode now, small: the array will be replaced or freed
+                    # by the pipeline; the retained copy is the ~50 KB PNG.
+                    self.retained.append((stem, strategy, step, self.seq,
+                                          _live_encode(image)))
+        return on_step
+
+    def frames(self, since: int = 0) -> list[dict]:
+        """Frames newer than `since` (a seq the client already has), encoded
+        on demand. Sending only what changed keeps a 3/s poll to one or two
+        small PNGs instead of every step of every strategy each time."""
+        import base64
+        with self.lock:
+            items = [(k, v) for k, v in self.latest.items() if v[0] > since]
+        out = []
+        for key, (seq, image) in items:
+            enc = self.encoded.get(key)
+            if enc is None or enc[0] != seq:
+                enc = (seq, _live_encode(image))
+                self.encoded[key] = enc
+            stem, strategy, step = key
+            out.append({'stem': stem, 'strategy': strategy, 'step': step,
+                        'seq': seq,
+                        'png': base64.b64encode(enc[1]).decode('ascii')})
+        out.sort(key=lambda f: f['seq'])
+        return out
+
+
+@app.get('/api/jobs/{job_id}/live')
+def job_live(job_id: str, since: int = 0):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, 'unknown job')
+    live = LIVE.get(job_id)
+    if live is None:
+        return {'enabled': False, 'frames': [], 'retained': 0, 'keep': False}
+    return {'enabled': True, 'frames': live.frames(since), 'keep': live.keep,
+            'seq': live.seq,
+            'retained': len(live.retained),
+            'status': job.get('status', 'unknown')}
+
+
+@app.post('/api/jobs/{job_id}/live/save')
+def job_live_save(job_id: str):
+    """Write the retained snapshots into the job's own work folder as PNGs
+    and release them from memory. The one place a live frame ever touches
+    disk, and only on this explicit request."""
+    job = JOBS.get(job_id)
+    live = LIVE.get(job_id)
+    if not job or live is None:
+        raise HTTPException(404, 'no live view for that job')
+    out = Path(job['out_dir']) / '_live'
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        n = 0
+        for stem, strategy, step, seq, png in live.retained:
+            if png:
+                (out / f'{stem}--{seq:04d}--{strategy}--{step}.png').write_bytes(png)
+                n += 1
+    except OSError as e:
+        raise HTTPException(507, f'could not write snapshots: {e}')
+    LIVE.pop(job_id, None)
+    return {'saved': n, 'dir': str(out)}
+
+
+@app.post('/api/jobs/{job_id}/live/discard')
+def job_live_discard(job_id: str):
+    LIVE.pop(job_id, None)
+    return {'ok': True}
 
 
 @app.get('/api/jobs/{job_id}')
@@ -610,6 +941,146 @@ def source(job_id: str, fname: str):
     return FileResponse(p)
 
 
+# --------------------------------------------------------------------------
+# Optional Burn Map refinement.  This is a separate, human-reviewed rescue
+# path; the five default candidates and their saved picks are untouched.
+
+def _refine_source(job_id: str, stem: str) -> Path:
+    job = JOBS.get(job_id)
+    if not job or Path(stem).name != stem:
+        raise HTTPException(404, 'unknown image')
+    src_dir = Path(job.get('src_dir', ''))
+    try:
+        matches = [p for p in src_dir.iterdir() if p.is_file() and p.stem == stem]
+    except OSError:
+        matches = []
+    if len(matches) != 1:
+        raise HTTPException(404, 'unknown image')
+    return matches[0]
+
+
+def _refine_editor(job_id: str, stem: str) -> BurnMap:
+    source_path = _refine_source(job_id, stem)
+    key = (job_id, stem)
+    with REFINE_LOCK:
+        editor = REFINE_STATES.get(key)
+        if editor is None:
+            try:
+                editor = BurnMap(source_path, max_dim=800)
+            except (OSError, ValueError, RuntimeError) as exc:
+                raise HTTPException(422, f'could not prepare refinement: {exc}') from exc
+            saved = REFINE_SNAPSHOTS.get(key)
+            if saved is not None:
+                editor.restore(saved)
+                REFINE_SNAPSHOTS.move_to_end(key)
+            REFINE_STATES[key] = editor
+            while len(REFINE_STATES) > REFINE_MAX_STATES:
+                evicted_key, evicted = REFINE_STATES.popitem(last=False)
+                REFINE_SNAPSHOTS[evicted_key] = evicted.snapshot()
+                REFINE_SNAPSHOTS.move_to_end(evicted_key)
+                while len(REFINE_SNAPSHOTS) > REFINE_MAX_SNAPSHOTS:
+                    REFINE_SNAPSHOTS.popitem(last=False)
+        else:
+            REFINE_STATES.move_to_end(key)
+        return editor
+
+
+def _refine_payload(job_id: str, stem: str, editor: BurnMap) -> dict:
+    base = f'/api/jobs/{quote(job_id, safe="")}/refine/{quote(stem, safe="")}'
+    payload = editor.state()
+    payload['assets'] = {name: f'{base}/asset/{quote(name, safe="")}'
+                         for name in ('source.png', 'overlay.png', 'result.png', 'diff.png')}
+    payload['download'] = f'{base}/download'
+    return payload
+
+
+@app.get('/api/jobs/{job_id}/refine/{stem}')
+def refine_state(job_id: str, stem: str):
+    editor = _refine_editor(job_id, stem)
+    return _refine_payload(job_id, stem, editor)
+
+
+@app.get('/api/jobs/{job_id}/refine/{stem}/asset/{fname}')
+def refine_asset(job_id: str, stem: str, fname: str):
+    if fname not in {'source.png', 'overlay.png', 'result.png', 'diff.png'}:
+        raise HTTPException(404, 'not found')
+    editor = _refine_editor(job_id, stem)
+    data = editor.assets().get(fname)
+    if data is None:
+        raise HTTPException(404, 'not found')
+    return Response(content=data, media_type='image/png', headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/jobs/{job_id}/refine/{stem}/download')
+def refine_download(job_id: str, stem: str):
+    editor = _refine_editor(job_id, stem)
+    download_name = f'{stem}-corrected.svg'
+    ascii_name = re.sub(r'[^A-Za-z0-9._ -]', '_', download_name).replace('"', '_')
+    disposition = (f'attachment; filename="{ascii_name}"; '
+                   f"filename*=UTF-8''{quote(download_name, safe='')}")
+    return Response(content=editor.svg(), media_type='image/svg+xml',
+                    headers={'Content-Disposition': disposition,
+                             'Cache-Control': 'no-store'})
+
+
+class RefineActionReq(BaseModel):
+    region_id: int | None = None
+    colour_label: int | None = None
+    proposal_id: str | None = None
+    x: int | None = None
+    y: int | None = None
+
+
+@app.post('/api/jobs/{job_id}/refine/{stem}/action')
+def refine_action(job_id: str, stem: str, req: RefineActionReq):
+    editor = _refine_editor(job_id, stem)
+    try:
+        if req.region_id is not None:
+            editor.toggle(req.region_id)
+        elif req.x is not None and req.y is not None:
+            region_id = editor.region_at(req.x, req.y)
+            if region_id < 0:
+                raise KeyError('no editable region at that point')
+            editor.toggle(region_id)
+        elif req.colour_label is not None:
+            editor.toggle_group(req.colour_label)
+        elif req.proposal_id:
+            editor.apply_proposal(req.proposal_id)
+        else:
+            raise KeyError('one refinement action is required')
+    except KeyError as exc:
+        raise HTTPException(400, f'unknown refinement target: {exc}') from exc
+    with REFINE_LOCK:
+        key = (job_id, stem)
+        REFINE_SNAPSHOTS[key] = editor.snapshot()
+        REFINE_SNAPSHOTS.move_to_end(key)
+        while len(REFINE_SNAPSHOTS) > REFINE_MAX_SNAPSHOTS:
+            REFINE_SNAPSHOTS.popitem(last=False)
+    return _refine_payload(job_id, stem, editor)
+
+
+class RefineSaveReq(BaseModel):
+    dest: str
+
+
+@app.post('/api/jobs/{job_id}/refine/{stem}/save')
+def refine_save(job_id: str, stem: str, req: RefineSaveReq):
+    editor = _refine_editor(job_id, stem)
+    dest = Path(req.dest).expanduser()
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        target = dest / f'{stem}-corrected.svg'
+        n = 1
+        while target.exists():
+            n += 1
+            target = dest / f'{stem}-corrected ({n}).svg'
+        target.write_bytes(editor.svg())
+    except OSError as exc:
+        raise HTTPException(400, f'Cannot write to {dest}: {exc}') from exc
+    write_settings({'dest': str(dest)})
+    return {'written': [target.name], 'dest': str(dest)}
+
+
 class SaveReq(BaseModel):
     dest: str
     picks: dict[str, str]          # image stem -> favourite strategy name
@@ -666,6 +1137,11 @@ def history():
 def forget_job(job_id: str):
     job = JOBS.pop(job_id, None)
     if job:
+        with REFINE_LOCK:
+            for key in [key for key in REFINE_STATES if key[0] == job_id]:
+                REFINE_STATES.pop(key, None)
+            for key in [key for key in REFINE_SNAPSHOTS if key[0] == job_id]:
+                REFINE_SNAPSHOTS.pop(key, None)
         shutil.rmtree(Path(job['out_dir']).parent, ignore_errors=True)
     return {'ok': True}
 
@@ -718,6 +1194,11 @@ def _clean_jobs(job_ids: list[str]) -> int:
     freed = 0
     for job_id in job_ids:
         freed += _dir_size(WORK / job_id)
+        with REFINE_LOCK:
+            for key in [key for key in REFINE_STATES if key[0] == job_id]:
+                REFINE_STATES.pop(key, None)
+            for key in [key for key in REFINE_SNAPSHOTS if key[0] == job_id]:
+                REFINE_SNAPSHOTS.pop(key, None)
         shutil.rmtree(WORK / job_id, ignore_errors=True)
         JOBS.pop(job_id, None)
     return freed
@@ -820,6 +1301,9 @@ class Settings(BaseModel):
     role: str | None = None
     auto_update: bool | None = None
     retention: str | None = None
+    live_view: bool | None = None
+    live_keep: bool | None = None
+    dev_mode: bool | None = None
 
 
 @app.get('/api/settings')
@@ -854,6 +1338,8 @@ class JudgeRow(BaseModel):
     shippable_ranks: list[int] = []
     of: int = 0
     failed: bool = False
+    excluded: bool = False          # dev mode: record it, then discount it
+    note: str | None = None         # dev mode: why nothing here was usable
 
 
 @app.post('/api/jobs/{job_id}/judge')
@@ -880,6 +1366,8 @@ def judge(job_id: str, rows: list[JudgeRow]):
                     'rank': (r.shippable_ranks[0]
                              if r.shippable_ranks and not r.failed else None),
                     'of': r.of,
+                    **({'excluded': True} if r.excluded else {}),
+                    **({'note': r.note.strip()} if (r.note or '').strip() else {}),
                     'source': role,
                     'origin': 'app',
                     'job': job_id,
@@ -887,6 +1375,188 @@ def judge(job_id: str, rows: list[JudgeRow]):
     except OSError:
         return {'ok': False}            # never let logging break a save
     return {'ok': True, 'recorded': len(rows)}
+
+
+# --------------------------------------------------------------------------
+# Purge - developer mode only, and the only genuinely destructive thing in
+# this server.
+#
+# `exclude` is the soft form and should be the common one: it appends a
+# tombstone, the image drops out of the statistics and comes BACK into the
+# calibration queue, and the file still says what happened. Purge is the hard
+# requested behavior: the image "fully deletes out of the corpus,
+# picks.py, and anywhere else it exists in this project". There is no undo and
+# no recycle bin - `/api/purge/plan` exists so the exact list of paths can be
+# put in front of a human before the second click.
+#
+# Bounded by construction: every root it will touch is named in PURGE_ROOTS,
+# names are compared literally (never globbed, so a stem full of glob
+# metacharacters cannot widen the sweep), and a stem carrying a path separator
+# is rejected outright.
+# --------------------------------------------------------------------------
+
+def _purge_roots() -> list[Path]:
+    return [_paths.CANDIDATES, _paths.CORPUS, _paths.INTAKE,
+            _paths.RUNS, _paths.INBOX]
+
+
+def _check_stem(stem: str) -> str:
+    stem = (stem or '').strip()
+    if not stem or stem in ('.', '..') or '/' in stem or '\\' in stem:
+        raise HTTPException(400, 'bad stem')
+    return stem
+
+
+def _purge_plan(stem: str) -> dict:
+    """Everything a purge of `stem` would remove. Pure: touches nothing."""
+    stem = _check_stem(stem)
+    paths: list[dict] = []
+    seen: set[Path] = set()
+
+    def add(path: Path, what: str) -> None:
+        if path in seen or not path.exists():
+            return
+        seen.add(path)
+        paths.append({'path': str(path), 'what': what,
+                      'dir': path.is_dir()})
+
+    # 1. the job folders in the work directory
+    if WORK.is_dir():
+        for job_dir in sorted(WORK.iterdir()):
+            src, out = job_dir / 'in', job_dir / 'out'
+            hits = [f for f in src.iterdir()
+                    if f.is_file() and f.stem == stem] if src.is_dir() else []
+            outs = [d for d in out.iterdir()
+                    if d.name == stem] if out.is_dir() else []
+            if not hits and not outs:
+                continue
+            others = [f for f in src.iterdir()
+                      if f.is_file() and f.stem != stem] if src.is_dir() else []
+            if hits and not others:
+                # the whole job was this one image: the folder goes with it,
+                # otherwise History keeps an entry that can no longer open.
+                add(job_dir, 'job history')
+                continue
+            for f in hits:
+                add(f, 'job source')
+            for d in outs:
+                add(d, 'traced candidates')
+
+    # 2. the private tree - literal name comparison, no globbing
+    for root in _purge_roots():
+        if not root.is_dir():
+            continue
+        for cur, dirnames, filenames in _os.walk(root):
+            curp = Path(cur)
+            for d in list(dirnames):
+                if d == stem:
+                    add(curp / d, f'{root.name}/')
+                    dirnames.remove(d)      # do not descend into it twice
+            for f in filenames:
+                if Path(f).stem == stem:
+                    add(curp / f, f'{root.name}/')
+
+    rows = {}
+    for label, f in (('app', APP_PICKS), ('calibration', CALIB_PICKS)):
+        n = 0
+        if f.is_file():
+            try:
+                for line in f.read_text().splitlines():
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(row, dict) and Path(
+                            str(row.get('image', ''))).stem == stem:
+                        n += 1
+            except OSError:
+                pass
+        rows[label] = n
+
+    return {'stem': stem, 'paths': paths, 'rows': rows,
+            'total': len(paths) + rows['app'] + rows['calibration']}
+
+
+def _strip_rows(f: Path, stem: str) -> int:
+    """Rewrite a pick log without any row for `stem`. Returns rows removed.
+
+    Written to a sibling temp file and replaced atomically, so a crash
+    mid-write leaves the original log intact rather than a half file - this
+    is ground truth for the calibration corpus.
+    """
+    if not f.is_file():
+        return 0
+    try:
+        lines = f.read_text().splitlines(keepends=True)
+    except OSError:
+        return 0
+    keep, dropped = [], 0
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            keep.append(line)               # never discard what we cannot read
+            continue
+        if isinstance(row, dict) and Path(str(row.get('image', ''))).stem == stem:
+            dropped += 1
+        else:
+            keep.append(line)
+    if not dropped:
+        return 0
+    tmp = f.with_suffix(f.suffix + '.tmp')
+    try:
+        tmp.write_text(''.join(keep))
+        tmp.replace(f)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        return 0
+    return dropped
+
+
+class PurgeReq(BaseModel):
+    stem: str
+
+
+def _require_dev() -> None:
+    if not load_settings().get('dev_mode'):
+        raise HTTPException(403, 'developer mode is off')
+
+
+@app.post('/api/purge/plan')
+def purge_plan(req: PurgeReq):
+    _require_dev()
+    return _purge_plan(req.stem)
+
+
+@app.post('/api/purge')
+def purge(req: PurgeReq):
+    """Delete every trace of one image. Irreversible, dev mode only."""
+    _require_dev()
+    plan = _purge_plan(req.stem)
+    removed, failed = [], []
+    for item in plan['paths']:
+        path = Path(item['path'])
+        try:
+            if item['dir']:
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+            removed.append(item['path'])
+        except OSError as e:
+            failed.append(f'{path}: {e}')
+    # Do not erase the only record of an image when any file deletion failed.
+    # A partially successful purge can be retried from the retained rows; a
+    # stripped log plus a locked source file leaves the two stores disagreeing
+    # and destroys the calibration provenance the purge is meant to clean up.
+    rows = ({'app': _strip_rows(APP_PICKS, plan['stem']),
+             'calibration': _strip_rows(CALIB_PICKS, plan['stem'])}
+            if not failed else {'app': 0, 'calibration': 0})
+    # A purged job folder must leave the in-memory index too, or History keeps
+    # offering a job whose files are gone.
+    for job_id in [j for j in list(JOBS) if not (WORK / j).is_dir()]:
+        JOBS.pop(job_id, None)
+    return {'ok': not failed, 'stem': plan['stem'], 'removed': removed,
+            'rows': rows, 'failed': failed}
 
 
 @app.get('/api/stats')
@@ -902,9 +1572,9 @@ def stats():
         'version': APP_VERSION,
         'calibration': {
             'available': CALIB_PICKS.is_file(),
-            **summarise(read_jsonl(CALIB_PICKS)),
+            **summarise(active_rows(read_jsonl(CALIB_PICKS))),
         },
-        'app': summarise(read_jsonl(APP_PICKS)),
+        'app': summarise(active_rows(read_jsonl(APP_PICKS))),
         'strategy_order': list(C.STRATEGIES),
     }
 
@@ -921,7 +1591,7 @@ def stats_report():
     cfg = load_settings()
     if not cfg.get('share_stats'):
         raise HTTPException(403, 'Stats sharing is off. Turn it on first.')
-    a = summarise(read_jsonl(APP_PICKS))
+    a = summarise(active_rows(read_jsonl(APP_PICKS)))
     return {
         'report': 't-tracer usage',
         'version': APP_VERSION,
