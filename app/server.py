@@ -43,7 +43,7 @@ STATIC = APP_DIR / 'static'
 
 # Working files live OUTSIDE the project, and this is not optional.
 #
-# This project sits inside a OneDrive tree. Every traced job writes a folder of
+# This project sits inside the synced workspace (OneDrive then, Syncthing now). Every traced job writes a folder of
 # PNGs and SVGs - roughly 15 files per image - and with .work/ under app/ that
 # is a sync storm on every run. the reviewer, watching it happen: "one drive is having
 # a stroke." It is the same trap the lineart venv already hit: OneDrive's skip
@@ -116,7 +116,7 @@ _TOKEN_QUERY_PATHS = re.compile(r'^(?:/api/jobs/[^/]+/(?:preview|source)/|/api/j
 
 # Settings and the app's own pick log live beside the work directory, i.e.
 # under ~/.cache (or LOCALAPPDATA), NEVER inside the project. Same reason the
-# work directory moved there: this repo sits in a OneDrive tree, and a file
+# work directory moved there: this repo sits in the synced workspace, and a file
 # rewritten on every save is a sync storm.
 SETTINGS_FILE = WORK.parent / 'settings.json'
 
@@ -140,6 +140,12 @@ APP_PICKS = WORK.parent / 'app-picks.jsonl'
 # ships the engine but not the corpus), which is expected, not an error.
 # Resolved through paths.py, which owns the location of everything private.
 CALIB_PICKS = _paths.PICKS
+
+# Per-CANDIDATE verdicts with the named defects behind every rejection, plus
+# hygiene at 1600px, 70 mm and 150 mm for that same candidate. Developer mode
+# only - it is the measuring instrument for hygiene (2026-10-02 fresh start),
+# not something a customer install should accumulate.
+VERDICTS = _paths.PRIVATE / 'verdicts' / 'verdicts.jsonl'
 
 # Uploads stream to disk in fixed chunks instead of through one bytes object.
 #
@@ -403,6 +409,33 @@ def _trace_one(img_path: str, out_root: str, on_step=None) -> dict:
     return _C.run_one(Path(img_path), Path(out_root), args)
 
 
+# One image may take at most this long (seconds) before it is skipped, so one
+# bad file - a phone photo of a 3D print froze two batches on 2026-10-02 - cannot
+# stall the batch. Only enforceable when the image traces in its own process,
+# i.e. with the live view off: a thread cannot be stopped from outside.
+IMAGE_TIME_LIMIT_S = 300  # ponytail: the multi-worker path is not limited; add a per-future kill if it ever freezes
+
+
+def _trace_child(img_path: str, out_root: str) -> None:
+    C._worker_init()
+    _trace_one(img_path, out_root)
+
+
+def _trace_with_limit(p: Path, out_dir: Path, limit: float) -> None:
+    import multiprocessing as mp
+    proc = mp.get_context().Process(target=_trace_child, args=(str(p), str(out_dir)), daemon=True)
+    proc.start()
+    proc.join(limit)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(5)
+        if proc.is_alive():
+            proc.kill()
+        raise TimeoutError(f'took longer than {int(limit)} s - skipped')
+    if proc.exitcode != 0:
+        raise RuntimeError(f'trace failed (exit code {proc.exitcode})')
+
+
 def _run_job(job_id: str) -> None:
     job = JOBS[job_id]
     # Queued is a real, reportable state - not a job that looks hung.
@@ -444,11 +477,18 @@ def _run_job_inner(job_id: str) -> None:
                         job['done'] += 1
         else:
             live = LIVE.get(job_id)
+            limit = load_settings().get('image_time_limit_s', IMAGE_TIME_LIMIT_S)
             for p in images:
                 err = None
                 try:
-                    _trace_one(str(p), str(out_dir),
-                               on_step=live.observer(p.stem) if live else None)
+                    if live or not limit:
+                        _trace_one(str(p), str(out_dir),
+                                   on_step=live.observer(p.stem) if live else None)
+                    else:
+                        _trace_with_limit(p, out_dir, float(limit))
+                except TimeoutError as e:
+                    err = f'{p.name}: {e}'
+                    job.setdefault('timed_out', []).append(p.stem)
                 except Exception as e:
                     err = f'{p.name}: {e}'
                 with LOCK:
@@ -633,8 +673,19 @@ def _in_flight_stems() -> set[str]:
     for job in JOBS.values():
         try:
             src = Path(job.get('src_dir', ''))
-            if src.is_dir():
-                out.update(p.stem for p in src.iterdir() if p.is_file())
+            if not src.is_dir():
+                continue
+            stems = {p.stem for p in src.iterdir() if p.is_file()}
+            if job.get('status') in ('ready', 'failed', 'interrupted'):
+                # A finished, failed or interrupted job holds back only what it
+                # actually traced (waiting on a verdict) and what timed out (it
+                # would only hang again). Images it never reached - the batch
+                # froze or was killed first - go back in the queue. Before
+                # 2026-10-02 they were held out forever.
+                outd = Path(job.get('out_dir', ''))
+                stems = {s for s in stems if (outd / s / 'metrics.json').exists()}
+                stems |= set(job.get('timed_out', []))
+            out |= stems
         except OSError:
             continue
     return out
@@ -870,6 +921,30 @@ def job_status(job_id: str):
             'errors': job.get('errors', []), 'rejected': job.get('rejected', [])}
 
 
+def _saved_reasons(job_id: str) -> dict:
+    """image -> {candidate -> {defects, note}} from the last saved VERDICTS row per
+    candidate, so reopening a job shows the ticks it was saved with (Wiki audit
+    K02: ticks lived only in the page and vanished on reopen). Read only."""
+    last = {}
+    try:
+        with VERDICTS.open() as f:
+            for line in f:
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if r.get('job') == job_id and r.get('candidate'):
+                    last[(r['image'], r['candidate'])] = r
+    except OSError:
+        return {}
+    out = {}
+    for (img, cand), r in last.items():
+        if r.get('defects') or r.get('note'):
+            out.setdefault(img, {})[cand] = {'defects': r.get('defects') or [],
+                                             'note': r.get('note') or ''}
+    return out
+
+
 @app.get('/api/jobs/{job_id}/results')
 def job_results(job_id: str):
     """One entry per image, candidates ranked by the shared ordering.
@@ -883,6 +958,8 @@ def job_results(job_id: str):
         raise HTTPException(404, 'unknown job')
     out = Path(job['out_dir'])
     images = []
+    saved = _saved_reasons(job_id)
+    import defects as D
     for d in sorted(p for p in out.iterdir()
                     if p.is_dir() and not p.name.startswith('_')):
         mp = d / 'metrics.json'
@@ -908,15 +985,25 @@ def job_results(job_id: str):
                 'headline': sc.get('headline', ''),
                 'nodes': sc.get('nodes'), 'paths': sc.get('paths'),
                 'preview': f'/api/jobs/{job_id}/preview/{d.name}/{name}.png',
+                'hires': (f'/api/jobs/{job_id}/preview/{d.name}/{name}.hi.png'
+                          if (d / f'{name}.hi.png').exists() else None),
             })
         src = next((p for p in Path(job['src_dir']).iterdir()
                     if p.stem == d.name), None)
+        try:
+            itype = json.loads((d / 'defects.json').read_text()).get('image_type')
+        except (OSError, json.JSONDecodeError):
+            itype = None
         images.append({
             'stem': d.name,
+            'image_type': itype,
+            'saved_reasons': saved.get(d.name, {}),
             'source': f'/api/jobs/{job_id}/source/{src.name}' if src else None,
             'candidates': cands,
         })
-    return {'images': images}
+    return {'images': images,
+            'legend': [{'key': k, 'label': l, 'means': m} for k, l, m in D.LEGEND],
+            'image_types': D.IMAGE_TYPES}
 
 
 @app.get('/api/jobs/{job_id}/preview/{stem}/{fname}')
@@ -1331,6 +1418,11 @@ def put_settings(req: Settings):
     return write_settings(patch)
 
 
+class Reason(BaseModel):
+    defects: list[str] = []
+    note: str | None = None
+
+
 class JudgeRow(BaseModel):
     stem: str
     pick: str | None = None
@@ -1340,6 +1432,8 @@ class JudgeRow(BaseModel):
     failed: bool = False
     excluded: bool = False          # dev mode: record it, then discount it
     note: str | None = None         # dev mode: why nothing here was usable
+    reasons: dict[str, Reason] = {}  # dev mode: candidate -> why it is not shippable
+    image_type: str | None = None   # dev mode: the reviewer's override of the auto type
 
 
 @app.post('/api/jobs/{job_id}/judge')
@@ -1374,7 +1468,54 @@ def judge(job_id: str, rows: list[JudgeRow]):
                 }) + '\n')
     except OSError:
         return {'ok': False}            # never let logging break a save
+    if load_settings().get('dev_mode'):
+        _write_verdicts(job_id, rows)
     return {'ok': True, 'recorded': len(rows)}
+
+
+def _write_verdicts(job_id: str, rows: list[JudgeRow]) -> None:
+    """One VERDICTS row per candidate: the reviewer's call and named defects,
+    next to every hygiene number that candidate got. Last row wins per
+    (job, image, candidate), so a changed mind just appends again."""
+    from datetime import date
+    out = Path(JOBS.get(job_id, {}).get('out_dir', ''))
+    try:
+        VERDICTS.parent.mkdir(parents=True, exist_ok=True)
+        with VERDICTS.open('a') as f:
+            for r in rows:
+                d = out / r.stem
+                try:
+                    metrics = json.loads((d / 'metrics.json').read_text())
+                except (OSError, json.JSONDecodeError):
+                    metrics = {}
+                try:
+                    dfx = json.loads((d / 'defects.json').read_text())
+                except (OSError, json.JSONDecodeError):
+                    dfx = {}
+                ranked = [n for n, _ in C.rank_candidates(metrics)] if metrics else []
+                names = ranked or list(r.reasons)
+                for n, name in enumerate(names, 1):
+                    ok = (not r.failed) and name in r.shippable
+                    why = r.reasons.get(name, Reason())
+                    f.write(json.dumps({
+                        'date': date.today().isoformat(),
+                        'job': job_id, 'image': r.stem, 'candidate': name,
+                        'rank': n, 'of': len(names),
+                        'picked': (not r.failed) and r.pick == name,
+                        'shippable': ok, 'nothing_usable': r.failed,
+                        'defects': [] if ok else why.defects,
+                        'note': None if ok else ((why.note or '').strip() or None),
+                        'image_note': (r.note or '').strip() or None,
+                        'image_type_auto': dfx.get('image_type'),
+                        'image_type': r.image_type or dfx.get('image_type'),
+                        **({'excluded': True} if r.excluded else {}),
+                        'render_px': dfx.get('render_px'),
+                        'hygiene_trace': metrics.get(name),
+                        'hygiene_70mm': dfx.get('sizes', {}).get('70mm', {}).get(name),
+                        'hygiene_150mm': dfx.get('sizes', {}).get('150mm', {}).get(name),
+                    }) + '\n')
+    except OSError:
+        pass                            # never let logging break a save
 
 
 # --------------------------------------------------------------------------

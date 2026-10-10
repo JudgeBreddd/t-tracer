@@ -62,3 +62,4 @@ app/T-Tracer.cmd
 # T-Tracer.png is the README hero image and IS published; the /*.png safety
 # net above would otherwise catch it on a re-add.
 !/T-Tracer.png
+AGENTS.md

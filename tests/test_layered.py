@@ -120,10 +120,10 @@ def test_memo_reuses_within_run_and_computes_outside():
         calls.append(flag)
         return np.array([True])
 
-    assert C._MEMO is None
+    assert C.tracestate._MEMO is None
     C._memo('t', fn, 1); C._memo('t', fn, 1)
     assert len(calls) == 2                      # no memo open -> computes
-    C._MEMO = {}
+    C.tracestate._MEMO = {}
     try:
         r1 = C._memo('t', fn, 1); r2 = C._memo('t', fn, 1)
         assert len(calls) == 3
@@ -131,7 +131,7 @@ def test_memo_reuses_within_run_and_computes_outside():
         C._memo('t', fn, 1, flag=True)          # overrides always compute
         assert len(calls) == 4
     finally:
-        C._MEMO = None
+        C.tracestate._MEMO = None
 
 
 def test_rasterize_evenodd_hole_survives_buffer_reuse():
@@ -196,16 +196,16 @@ def test_default_sheet_is_five():
 
 def test_progress_sink_is_silent_when_unset_and_throttled_when_set():
     seen = []
-    assert C._PROGRESS is None
+    assert C.tracestate._PROGRESS is None
     C._progress('x', lambda: seen.append(1) or 'img')
     assert seen == []                                   # image never built
-    C._PROGRESS = lambda step, img: seen.append((step, img))
-    C._PROGRESS_T = 0.0
+    C.tracestate._PROGRESS = lambda step, img: seen.append((step, img))
+    C.tracestate._PROGRESS_T = 0.0
     try:
         C._progress('a', lambda: 'A'); C._progress('b', lambda: 'B')
         assert seen == [('a', 'A')]                      # second frame inside 1/3 s dropped
     finally:
-        C._PROGRESS = None
+        C.tracestate._PROGRESS = None
 
 
 def test_fused_extent_is_the_minority_population_not_the_whole_component():

@@ -33,7 +33,12 @@ function withToken(url) {
 // version replaced the list on every upload, so adding a second logo silently
 // erased the first one along with its picks.
 const state = { jobId: null, images: [], sel: {}, fav: {}, failed: {},
-                touched: {}, notes: {} };
+                touched: {}, notes: {},
+                // dev mode: key -> {candidate -> {defects: [...], note}} and
+                // key -> image-type override (2026-10-02 defect calibration)
+                reasons: {}, itype: {} };
+let legend = [];          // [{key, label, means}] - one word, one meaning
+let imageTypes = [];
 
 /* ---------------- destination folder ----------------
  * Kept SERVER-side rather than in localStorage, and that is the entire fix for
@@ -315,7 +320,10 @@ $('#live-discard').addEventListener('click', async () => {
 /* ---------------- results ---------------- */
 async function loadResults(jobId) {
   const r = await apiFetch(`/api/jobs/${jobId}/results`);
-  const fresh = (await r.json()).images;
+  const body = await r.json();
+  const fresh = body.images;
+  legend = body.legend || legend;
+  imageTypes = body.image_types || imageTypes;
   const box = $('#results');
   box.hidden = false;
 
@@ -326,12 +334,19 @@ async function loadResults(jobId) {
     // once, so every consumer downstream (cards, the full-size viewer) just
     // uses img.source / candidate.preview and gets a working URL for free.
     img.source = withToken(img.source);
-    img.candidates.forEach((c) => { c.preview = withToken(c.preview); });
+    img.candidates.forEach((c) => {
+      c.preview = withToken(c.preview);
+      if (c.hires) c.hires = withToken(c.hires);
+    });
     // A repeat of the same filename would collide on `stem` as the key, so it
     // gets a display key that stays unique across drops. The saved SVG keeps
     // the plain name; the server handles that collision separately.
     img.key = state.images.some((x) => x.stem === img.stem)
       ? `${img.stem}#${jobId.slice(0, 4)}` : img.stem;
+    // Reopened job: show the defect ticks it was saved with (Wiki audit K02).
+    if (img.saved_reasons && Object.keys(img.saved_reasons).length && !state.reasons[img.key]) {
+      state.reasons[img.key] = img.saved_reasons;
+    }
     // Sensible default: the top-ranked candidate starts starred. Across 26
     // judged images the top-scored one was shippable 81% of the time, so this
     // is usually right and always one click from being changed.
@@ -430,6 +445,19 @@ function cardFor(img) {
     del.title = 'Erase this image and every trace of it, permanently';
     del.addEventListener('click', (e) => { e.stopPropagation(); purgeImage(img.key); });
     right.append(ex, del);
+  }
+  if (settings.dev_mode && imageTypes.length) {
+    // Auto-tagged by defects.image_type; the reviewer's change is recorded
+    // beside the auto value so the rules can be checked against it.
+    const ty = document.createElement('select');
+    ty.className = 'itype';
+    ty.title = 'Image type (auto-tagged; change it if wrong)';
+    ty.innerHTML = imageTypes.map((t) => `<option value="${esc(t)}"${
+      t === img.image_type ? ' selected' : ''}>${esc(t)}${
+      t === img.image_type ? ' (auto)' : ''}</option>`).join('');
+    ty.addEventListener('click', (e) => e.stopPropagation());
+    ty.addEventListener('change', () => { state.itype[img.key] = ty.value; });
+    right.append(ty);
   }
   right.append(caret, close);
   head.append(h2, right);
@@ -567,7 +595,8 @@ function tileFor(stem, c) {
       <span class="tile-name">${c.n}. ${esc(c.name)}</span>
       <span class="tile-score">${c.score}</span>
     </div>
-    <div class="tile-head">${esc(c.headline || '')}</div>`;
+    <div class="tile-head">${esc(c.headline || '')}</div>
+    <div class="tile-why"></div>`;
 
   t.querySelector('.expand').addEventListener('click', (e) => {
     e.stopPropagation();
@@ -630,6 +659,12 @@ function paint(stem) {
     const n = t.dataset.name;
     t.classList.toggle('on', sel.has(n));
     t.classList.toggle('fav', state.fav[stem] === n);
+    const why = t.querySelector('.tile-why');
+    if (why) {
+      const r = (state.reasons[stem] || {})[n];
+      const labels = r ? r.defects.map((k) => (legend.find((l) => l.key === k) || {}).label || k) : [];
+      why.textContent = (!sel.has(n) && settings.dev_mode && labels.length) ? `✗ ${labels.join(', ')}` : '';
+    }
   });
   const st = document.querySelector(`.state[data-for="${cssEsc(stem)}"]`);
   if (st) {
@@ -853,6 +888,8 @@ function judgementFor(img) {
     // itself so a later reader of the log can tie the verdict to WHY, the
     // same way pick.py's rows tie a pick to the image it was made on.
     note: state.notes[img.key] || null,
+    reasons: state.reasons[img.key] || {},
+    image_type: state.itype[img.key] || null,
   };
 }
 
@@ -1704,7 +1741,9 @@ function paintViewer() {
 
   $('#v-title').textContent = img.stem;
   $('#v-score').textContent = `${c.name} · score ${c.score}`;
-  $('#v-img').src = c.preview;
+  $('#v-img').src = c.hires || c.preview;
+  $('#v-img').classList.remove('zoom');
+  $('#v-img').closest('.v-plate').classList.remove('zoomed');
   $('#v-img').alt = `${c.name} result for ${img.stem}`;
   $('#v-src').src = img.source || '';
   $('#v-src').closest('.v-pane').hidden = !img.source;
@@ -1722,7 +1761,35 @@ function paintViewer() {
   $('#v-pick').classList.toggle('on', picked);
   $('#v-star').textContent = starred ? 'Starred ★' : 'Star this one';
   $('#v-star').classList.toggle('on', starred);
+  paintWhy(img, c, picked);
 }
+
+/* Why-not panel: shown for a candidate that is NOT marked shippable, in
+ * developer mode. Each box is one legend entry, its meaning printed beside it
+ * so the reviewer and the scorer read the same word the same way. */
+function paintWhy(img, c, picked) {
+  const box = $('#v-why');
+  box.hidden = !settings.dev_mode || picked || !legend.length;
+  if (box.hidden) return;
+  const r = ((state.reasons[img.key] ||= {})[c.name] ||= { defects: [], note: '' });
+  box.innerHTML = `<div class="why-title">Why is <b>${esc(c.name)}</b> not shippable?</div>
+    <div class="why-grid">${legend.map((l) => `<label class="why-item">
+      <input type="checkbox" value="${esc(l.key)}"${r.defects.includes(l.key) ? ' checked' : ''}>
+      <span><b>${esc(l.label)}</b> <small>${esc(l.means)}</small></span></label>`).join('')}</div>
+    <input class="why-note" type="text" placeholder="Anything else (optional)" value="${esc(r.note || '')}">`;
+  box.querySelectorAll('input[type=checkbox]').forEach((cb) => cb.addEventListener('change', () => {
+    r.defects = [...box.querySelectorAll('input[type=checkbox]:checked')].map((x) => x.value);
+    paint(img.key);
+  }));
+  box.querySelector('.why-note').addEventListener('input', (e) => { r.note = e.target.value; });
+}
+
+// Click the candidate to see it 1:1 - the full-size render is the same raster
+// hygiene scored, and fitting it to the screen hides exactly what is judged.
+$('#v-img').addEventListener('click', () => {
+  $('#v-img').classList.toggle('zoom');
+  $('#v-img').closest('.v-plate').classList.toggle('zoomed');
+});
 
 $('#v-close').addEventListener('click', closeViewer);
 $('#v-prev').addEventListener('click', () => stepViewer(-1));
@@ -1756,6 +1823,8 @@ $('#v-star').addEventListener('click', () => {
 
 document.addEventListener('keydown', (e) => {
   if ($('#viewer').hidden) return;
+  // Typing a reason must not page, mark or star - only Escape gets through.
+  if (e.target.matches('input, textarea, select') && e.key !== 'Escape') return;
   const keys = {
     Escape: closeViewer,
     ArrowLeft: () => stepViewer(-1),

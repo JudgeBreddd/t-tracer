@@ -35,7 +35,7 @@ names churn, which is everything else.
 OVERRIDE
 --------
 `TT_PRIVATE_DIR` points the whole private tree somewhere else - another disk,
-a location outside the OneDrive sync, or a throwaway path in a test. Matches
+a location outside the synced workspace, or a throwaway path in a test. Matches
 the TT_* convention already used by TT_WORK_DIR, TT_REPO and TT_MAX_UPLOAD_MB.
 """
 

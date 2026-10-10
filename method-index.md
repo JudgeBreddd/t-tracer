@@ -4,7 +4,7 @@ One entry per strategy: the ordered steps it runs, and every parameter that
 touches its result. Built to drive the parameter sweep, not to explain the code
 — for *why* a method exists, read its docstring in `_engine/candidates.py`.
 
-**Complete:** 5 default + 13 optional + 3 archived. Written 2026-09-08; `kmeans-layered` and `layerlines` added and the sheet trimmed to five 2026-09-15 (evidence in the `OPTIONAL` comment in `candidates.py`).
+**Complete:** 6 default (fieldflip is a trial, 2026-09-22) + 4 optional + 9 removed 2026-09-22 + 3 archived. Written 2026-09-08; `kmeans-layered` and `layerlines` added and the sheet trimmed to five 2026-09-15 (evidence in the `OPTIONAL` comment in `candidates.py`).
 
 ---
 
@@ -227,6 +227,9 @@ map, which puts red back on the background side — the failure it was built to 
 | ring radius fraction | 0.0015 (hardcoded) |
 
 ## keyfill — 0 picks (new 2026-09-07)
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. `ink = strat_keyline(...)`; if it abstained, pass the abstention through
 2. `_thicken_thin(ink, _floor_px(rgb, floor_frac))`
@@ -241,6 +244,9 @@ map, which puts red back on the background side — the failure it was built to 
 | + all of `keyline` | — |
 
 ## keyflip — 0 picks (new 2026-09-07)
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. `ink = strat_keyline(...)`; abstain passthrough
 2. `_flip_fields(ink, ring_px = max(1, round(0.0015 × long_edge)))`
@@ -277,6 +283,9 @@ map, which puts red back on the background side — the failure it was built to 
 | `NEURAL_MAX_DIM` | **1024, constant** |
 
 ## linework — 1 pick
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. `sil = _silhouette_of(rgb, alpha)`
 2. K-means in Lab over silhouette pixels only, seed 0
@@ -303,6 +312,9 @@ map, which puts red back on the background side — the failure it was built to 
 # OFF THE SHEET — 6 optional (`--strategies` only)
 
 ## neural — 1 pick. Demoted; `nested` supersedes it
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. `_lineart_lines()` — identical to `nested` step 1
 2. Regions from `~lines`; per-region median L*
@@ -315,6 +327,9 @@ map, which puts red back on the background side — the failure it was built to 
 Same parameters as `nested`, minus `dE`.
 
 ## plate — 1 pick. Demoted 2026-09-05: most elaborate, never won
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. Silhouette, then K-means in Lab
 2. **Figure/ground first:** the cluster owning most of the silhouette *rim* is
@@ -332,6 +347,9 @@ Same parameters as `nested`, minus `dE`.
 | existing-hairline ratio | 0.35 |
 
 ## inotsu — 0 picks. Off-sheet: differs from otsu by 0.15–3.4% of pixels
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. Artwork mask: alpha if real, else Lab distance > `lab_tol`
 2. Otsu computed over `gray[art]` **only** — not the whole frame
@@ -340,6 +358,9 @@ Same parameters as `nested`, minus `dE`.
 `lab_tol` 14.0. Falls back to plain otsu if artwork < 16 px.
 
 ## triotsu — 0 picks. **TESTED 2026-09-06 AND IT FAILS**
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. Artwork mask as `inotsu`
 2. `threshold_multiotsu(gray[art], classes=3)`
@@ -353,6 +374,9 @@ by luminance at any number of classes. The difference is structural — which is
 `nested`'s question.
 
 ## sauvola — 0 picks
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. Grayscale
 2. Sauvola local adaptive threshold (window forced odd)
@@ -361,6 +385,9 @@ by luminance at any number of classes. The difference is structural — which is
 `window` 51, `k` 0.25. Keeps 6pt text global otsu erases; pays in speckle.
 
 ## edges — 0 picks. Exists for photographs of physical patches
+*Code removed 2026-09-22 (over-engineering audit). The steps and parameters
+below are the record; recover the function with `git show 6f1e1d4:_engine/candidates.py`.*
+
 
 1. Grayscale, bilateral filter (d=7, σ=60/60)
 2. Canny with median-relative thresholds (0.66×med, 1.33×med)
@@ -414,7 +441,7 @@ Shared parameters swept once on **otsu**, which has none of its own:
 4. `--max-dim`
 5. `--min-island`
 
-Then per-method knobs, cheapest first: `bgdist` (0) → `sauvola` (2) →
-`inotsu`/`triotsu` (1) → `kmeans` (1) → `edges` (2) → `silhouette` (2) →
-`linework` (7) → `plate` (3) → `nested` (6) → `keyline` (7) → `keyfill` (+2) →
-`keyflip` (+5) → `composite` (3 + nested's).
+Then per-method knobs, cheapest first: `bgdist` (0) → `kmeans` (1) →
+`silhouette` (2) → `nested` (6) → `keyline` (7) → `composite` (3 + nested's).
+The nine removed methods are out of the sweep; their knobs are recorded above
+if one is ever restored.

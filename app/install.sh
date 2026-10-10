@@ -10,8 +10,8 @@
 # starts fast and a torch problem cannot break plain tracing.
 #
 # The annotator venv lives OUTSIDE this folder on purpose: this project sits in
-# a OneDrive tree, and OneDrive's skip list matches the name ".venv" exactly, so
-# an in-project ".venv-lineart" would sync 1.4 GB to the desktop.
+# the synced workspace, and a 1.4 GB annotator venv has no business syncing to
+# every machine.
 
 set -euo pipefail
 
