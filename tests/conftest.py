@@ -1,7 +1,7 @@
 """Shared fixtures for the T-Tracer test suite.
 
 Tests exercise real logic in app/server.py against a throwaway work directory
-- never `~/.cache/t-tracer/`, and never a directory under OneDrive. server.py
+- never `~/.cache/t-tracer/`, and never a directory inside the synced workspace. server.py
 reads TT_WORK_DIR once, at import time (`WORK = _work_dir()`), so it has to be
 set before the module is first imported anywhere in the test session.
 """

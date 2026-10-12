@@ -511,6 +511,20 @@ table.stat th.num,table.stat td.num{
   border-top:1px solid var(--border-subtle);
 }
 @media (max-width:900px){ .viewer-body{flex-direction:column} }
+.v-plate.zoomed{overflow:auto; display:block; cursor:zoom-out}
+.v-plate img{cursor:zoom-in}
+.v-plate img.zoom{max-width:none; max-height:none}
+.v-why{
+  padding:var(--s3) var(--s4); background:var(--surface-1);
+  border-top:1px solid var(--border-subtle); font-size:12px; color:var(--text-primary);
+}
+.why-title{margin-bottom:var(--s2)}
+.why-grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:4px var(--s4)}
+.why-item{display:flex; gap:6px; align-items:baseline; cursor:pointer}
+.why-item small{color:var(--text-muted)}
+.why-note{width:100%; margin-top:var(--s2); box-sizing:border-box}
+.tile-why{font-size:10px; color:var(--accent-red-bright); padding:0 6px 4px}
+.itype{font-size:11px}
 
 /* ---------- developer mode ----------
  * The two per-card dev controls reuse .nothing so they sit in the head bar at

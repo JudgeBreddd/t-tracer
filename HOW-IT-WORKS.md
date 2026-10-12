@@ -332,7 +332,7 @@ detection the app starts and silently never opens a window.
 **All state lives outside the repo**, in `~/.cache/t-tracer/`
 (`%LOCALAPPDATA%` on Windows, `TT_WORK_DIR` to override): traced jobs,
 `settings.json`, and the app's own pick log. This is not tidiness — the
-development copy sits in a OneDrive tree, and every traced job writes roughly
+development copy sits in the synced workspace, and every traced job writes roughly
 fifteen files per image.
 
 **History** is a `job.json` per job folder, rebuilt by scanning the work

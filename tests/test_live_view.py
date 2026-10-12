@@ -78,16 +78,16 @@ def test_run_strategies_streams_trace_frames_then_scored(server, tmp_path):
     cv2.circle(img, (120, 120), 80, (0, 0, 0), -1)
     cv2.circle(img, (120, 120), 30, (255, 255, 255), -1)
     frames = []
-    C.PROGRESS_HZ = 1e9                      # no throttle inside the test
+    C.tracestate.PROGRESS_HZ = 1e9                      # no throttle inside the test
     try:
         args = server.cli_defaults(on_step=lambda n, s, im: frames.append((n, s)))
-        C._MEMO = {}
+        C.tracestate._MEMO = {}
         C._run_strategies(['otsu'], img, None, cv2.cvtColor(img, cv2.COLOR_RGB2GRAY),
                           args, tmp_path, {}, [], args.on_step)
     finally:
-        C._MEMO = None
-        C.PROGRESS_HZ = 3.0
+        C.tracestate._MEMO = None
+        C.tracestate.PROGRESS_HZ = 3.0
     steps = [s for _, s in frames]
     assert steps[0] == 'mask' and steps[-1] == 'scored'
     assert 'trace' in steps and 'render' in steps
-    assert C._PROGRESS is None
+    assert C.tracestate._PROGRESS is None
