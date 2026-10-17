@@ -959,6 +959,7 @@ def job_results(job_id: str):
     out = Path(job['out_dir'])
     images = []
     saved = _saved_reasons(job_id)
+    drafts = _read_drafts(job)
     import defects as D
     for d in sorted(p for p in out.iterdir()
                     if p.is_dir() and not p.name.startswith('_')):
@@ -998,6 +999,7 @@ def job_results(job_id: str):
             'stem': d.name,
             'image_type': itype,
             'saved_reasons': saved.get(d.name, {}),
+            'draft': drafts.get(d.name),
             'source': f'/api/jobs/{job_id}/source/{src.name}' if src else None,
             'candidates': cands,
         })
@@ -1434,6 +1436,51 @@ class JudgeRow(BaseModel):
     note: str | None = None         # dev mode: why nothing here was usable
     reasons: dict[str, Reason] = {}  # dev mode: candidate -> why it is not shippable
     image_type: str | None = None   # dev mode: the reviewer's override of the auto type
+
+
+# Per-click draft (K02, Tyler 2026-10-12): the page's star, selection and
+# defect ticks for each image, written on every click so a crash or kill loses
+# nothing and Reopen brings the job back exactly as it was left. Separate from
+# VERDICTS on purpose: that log is calibration ground truth and only takes
+# rows on Save, never half-finished clicks. Lives in out_dir, so it goes when
+# the job is cleaned; `_` prefix keeps results' image scan off it.
+def _draft_path(job: dict) -> Path:
+    return Path(job['out_dir']) / '_draft.json'
+
+
+def _read_drafts(job: dict) -> dict:
+    try:
+        d = json.loads(_draft_path(job).read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError, KeyError):
+        return {}
+
+
+class DraftReq(BaseModel):
+    fav: str | None = None
+    sel: list[str] = []
+    touched: bool = False
+    reasons: dict[str, Reason] = {}
+
+
+@app.put('/api/jobs/{job_id}/draft/{stem}')
+def job_draft(job_id: str, stem: str, req: DraftReq):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, 'unknown job')
+    stem = _check_stem(stem)
+    drafts = _read_drafts(job)
+    drafts[stem] = req.model_dump()
+    p = _draft_path(job)
+    tmp = p.with_suffix('.tmp')
+    try:
+        # tmp + replace: a kill mid-write leaves the previous draft, never a
+        # truncated one.
+        tmp.write_text(json.dumps(drafts))
+        _os.replace(tmp, p)
+    except OSError:
+        return {'ok': False}            # never let a draft break the page
+    return {'ok': True}
 
 
 @app.post('/api/jobs/{job_id}/judge')
