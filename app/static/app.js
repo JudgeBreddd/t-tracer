@@ -347,10 +347,18 @@ async function loadResults(jobId) {
     if (img.saved_reasons && Object.keys(img.saved_reasons).length && !state.reasons[img.key]) {
       state.reasons[img.key] = img.saved_reasons;
     }
+    // ...and, newer than that, the per-click draft: star, selection and ticks
+    // exactly as they were left, saved or not (K02, 2026-10-12).
+    const d = img.draft;
+    if (d) {
+      state.fav[img.key] = d.fav;
+      state.sel[img.key] = new Set(d.sel);
+      state.touched[img.key] = d.touched;
+      if (Object.keys(d.reasons).length) state.reasons[img.key] = d.reasons;
     // Sensible default: the top-ranked candidate starts starred. Across 26
     // judged images the top-scored one was shippable 81% of the time, so this
     // is usually right and always one click from being changed.
-    if (img.candidates.length) {
+    } else if (img.candidates.length) {
       state.fav[img.key] = img.candidates[0].name;
       state.sel[img.key] = new Set([img.candidates[0].name]);
     }
@@ -643,6 +651,7 @@ function toggle(stem, name) {
     if (!state.fav[stem]) state.fav[stem] = name;
   }
   paint(stem);
+  saveDraft(stem);
 }
 
 function star(stem, name) {
@@ -651,6 +660,20 @@ function star(stem, name) {
   (state.sel[stem] ||= new Set()).add(name);
   state.fav[stem] = name;
   paint(stem);
+  saveDraft(stem);
+}
+
+// Every click goes straight to the job's draft on disk, so a crash or kill
+// loses nothing and Reopen brings back star, selection and ticks (K02).
+// Fire-and-forget: a failed draft write must never block the click.
+function saveDraft(key) {
+  const img = state.images.find((i) => i.key === key);
+  if (!img) return;
+  apiFetch(`/api/jobs/${img.jobId}/draft/${encodeURIComponent(img.stem)}`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fav: state.fav[key] || null, sel: [...(state.sel[key] || [])],
+                           touched: !!state.touched[key], reasons: state.reasons[key] || {} }),
+  }).catch(() => {});
 }
 
 function paint(stem) {
@@ -1780,8 +1803,10 @@ function paintWhy(img, c, picked) {
   box.querySelectorAll('input[type=checkbox]').forEach((cb) => cb.addEventListener('change', () => {
     r.defects = [...box.querySelectorAll('input[type=checkbox]:checked')].map((x) => x.value);
     paint(img.key);
+    saveDraft(img.key);
   }));
   box.querySelector('.why-note').addEventListener('input', (e) => { r.note = e.target.value; });
+  box.querySelector('.why-note').addEventListener('change', () => saveDraft(img.key));
 }
 
 // Click the candidate to see it 1:1 - the full-size render is the same raster
